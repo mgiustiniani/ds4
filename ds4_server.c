@@ -667,6 +667,7 @@ typedef struct {
     bool stream_include_usage;
     int cache_read_tokens;
     int cache_write_tokens;
+    uint8_t kv_retention;
     ds4_think_mode think_mode;
     bool has_tools;
     bool prompt_preserves_reasoning;
@@ -821,6 +822,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->temperature = DS4_DEFAULT_TEMPERATURE;
     r->top_p = DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
+    r->kv_retention = DS4_KVSTORE_RETENTION_LEGACY;
     r->think_mode = DS4_THINK_HIGH;
 }
 
@@ -8350,6 +8352,11 @@ typedef ds4_kvstore_options kv_cache_options;
 typedef ds4_kvstore kv_disk_cache;
 
 typedef enum {
+    KV_CACHE_PRIORITY_NONE = 0,
+    KV_CACHE_PRIORITY_MULTIAGENT,
+} kv_cache_priority_mode;
+
+typedef enum {
     TOOL_MEMORY_RAM = 0,
     TOOL_MEMORY_DISK = 1,
 } tool_memory_source;
@@ -8425,6 +8432,7 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    uint8_t kv_retention;
 
     job *assigned;
     job *running;
@@ -8452,6 +8460,7 @@ struct server {
     pthread_t decode_thread;
     int default_tokens;
     kv_disk_cache kv;
+    kv_cache_priority_mode kv_priority_mode;
     tool_memory tool_mem;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
@@ -9312,12 +9321,14 @@ static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wante
 
 #ifdef DS4_SERVER_TEST
 static void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
-                           uint8_t reason, uint8_t ext_flags,
+                           uint8_t reason, uint8_t retention,
+                           uint8_t ext_flags,
                            uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                            uint64_t created_at, uint64_t last_used,
                            uint64_t payload_bytes) {
-    ds4_kvstore_fill_header(h, 0, quant_bits, reason, ext_flags, tokens, hits,
-                            ctx_size, created_at, last_used, payload_bytes);
+    ds4_kvstore_fill_header(h, 0, quant_bits, reason, retention, ext_flags,
+                            tokens, hits, ctx_size,
+                            created_at, last_used, payload_bytes);
 }
 #endif
 
@@ -9378,10 +9389,10 @@ static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
 #endif
 
 #ifdef DS4_SERVER_TEST
-static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
+static bool kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
                            uint64_t extra_bytes,
                            const ds4_kvstore_eviction_context *incoming) {
-    ds4_kvstore_evict(kc, live, extra_bytes, incoming);
+    return ds4_kvstore_evict(kc, live, extra_bytes, incoming);
 }
 #endif
 
@@ -9495,6 +9506,7 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
 static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             const ds4_tokens *tokens,
                                             int store_len, const char *reason,
+                                            uint8_t retention,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
                                             const char *cache_text_key) {
@@ -9506,6 +9518,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
     bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
                                                   slot->session,
                                                   tokens, store_len, reason,
+                                                  retention,
                                                   cache_text_override,
                                                   cache_text_ext,
                                                   cache_text_key,
@@ -9517,9 +9530,10 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
 
 static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                        const ds4_tokens *tokens,
-                                       int store_len, const char *reason) {
+                                       int store_len, const char *reason,
+                                       uint8_t retention) {
     return kv_cache_store_live_prefix_text(s, slot, tokens, store_len, reason,
-                                           NULL, 0, NULL);
+                                           retention, NULL, 0, NULL);
 }
 
 static void kv_cache_store_current(server *s, server_slot *slot,
@@ -9558,10 +9572,12 @@ static void kv_cache_store_current(server *s, server_slot *slot,
      * tokenizes only the visible suffix that follows this key. */
     if (visible_text) {
         kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
+                                        slot->kv_retention,
                                         visible_text, visible_ext, visible_key);
         free(visible_text);
     } else {
-        kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
+        kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason,
+                                   slot->kv_retention);
     }
 }
 
@@ -9635,7 +9651,8 @@ static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     if (!tokens) return;
     const int target = kv_cache_slot_continued_target(s, slot, tokens->len);
     if (target == 0) return;
-    if (kv_cache_store_live_prefix(s, slot, tokens, target, "continued")) {
+    if (kv_cache_store_live_prefix(s, slot, tokens, target, "continued",
+                                   slot->kv_retention)) {
         (void)kc;
         kv_cache_slot_note_store(slot, target);
     }
@@ -9653,6 +9670,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
+                                  uint8_t retention,
                                   bool responses_protocol) {
     if (!s || !slot) return 0;
     if (loaded_path_out) *loaded_path_out = NULL;
@@ -9663,7 +9681,8 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     pthread_mutex_lock(&s->kv_mu);
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, slot->session,
                                            prompt_text, effective_prompt, &lr,
-                                           &hooks, responses_protocol);
+                                           &hooks, retention,
+                                           responses_protocol);
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     if (loaded > 0) {
@@ -9682,6 +9701,7 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                                   effective_prompt,
                                   loaded_path_out,
                                   loaded_ext_flags_out,
+                                  req ? req->kv_retention : slot->kv_retention,
                                   req && req->api == API_RESPONSES);
 }
 
@@ -10862,7 +10882,8 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, slot,
                                             rendered.ptr ? rendered.ptr : "",
-                                            &effective, &path, NULL, false);
+                                            &effective, &path, NULL,
+                                            slot->kv_retention, false);
         if (loaded == 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_invalidate(slot->session);
@@ -11323,6 +11344,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    /* Any displaced live checkpoint was persisted above with its old class.
+     * Stores produced by this request now inherit the incoming message class. */
+    slot->kv_retention = j->req.kv_retention;
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
         ((!strcmp(cache_source, "responses-visible") ||
@@ -11409,6 +11433,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
+    uint8_t cold_retention = slot->kv_retention;
     if (cached == 0 &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
@@ -11418,8 +11443,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
                                                     ds4_token_user(s->engine),
                                                     ds4_token_assistant(s->engine));
-        cold_store_len = anchor >= s->kv.opt.min_tokens ?
-                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        if (anchor >= s->kv.opt.min_tokens) {
+            cold_store_len = anchor;
+            /* This prefix contains the reusable agent/tool prompt but not the
+             * main or delegated task message. */
+            if (s->kv_priority_mode == KV_CACHE_PRIORITY_MULTIAGENT)
+                cold_retention = DS4_KVSTORE_RETENTION_STABLE_PREFIX;
+        } else {
+            cold_store_len = kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        }
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -11458,7 +11490,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             return;
         }
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
-                                       cold_store_len, "cold")) {
+                                       cold_store_len, "cold",
+                                       cold_retention)) {
             kv_cache_slot_note_store(slot, cold_store_len);
             suppressed_continued_last = -1;
         } else {
@@ -11513,7 +11546,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                now_sec() - t0);
     if (cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
-                                       cold_store_len, "cold")) {
+                                       cold_store_len, "cold",
+                                       cold_retention)) {
             kv_cache_slot_note_store(slot, cold_store_len);
             suppressed_continued_last = -1;
         } else {
@@ -12527,6 +12561,7 @@ typedef struct {
     char path[256];
     char *body;
     size_t body_len;
+    uint8_t kv_retention;
 } http_request;
 
 static void http_request_free(http_request *r) {
@@ -12561,6 +12596,32 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
+static uint8_t message_retention(const char *h, size_t n) {
+    static const char name[] = "X-DS4-Message-Origin:";
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        const char *line_end = p;
+        if (line_end > line && line_end[-1] == '\r') line_end--;
+        if ((size_t)(line_end - line) >= sizeof(name) - 1 &&
+            strncasecmp(line, name, sizeof(name) - 1) == 0)
+        {
+            const char *value = line + sizeof(name) - 1;
+            while (value < line_end && isspace((unsigned char)*value)) value++;
+            while (line_end > value && isspace((unsigned char)line_end[-1])) line_end--;
+            size_t len = (size_t)(line_end - value);
+            if (len == 8 && strncasecmp(value, "subagent", len) == 0)
+                return DS4_KVSTORE_RETENTION_BACKGROUND;
+            if (len == 4 && strncasecmp(value, "main", len) == 0)
+                return DS4_KVSTORE_RETENTION_FOREGROUND;
+            break;
+        }
+        if (p < end) p++;
+    }
+    return DS4_KVSTORE_RETENTION_FOREGROUND;
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -12589,6 +12650,7 @@ static bool read_http_request(int fd, http_request *r) {
     if (q) *q = '\0';
 
     long clen = content_length(b.ptr, (size_t)hend);
+    r->kv_retention = message_retention(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
     while (b.len < (size_t)hend + (size_t)clen) {
         char tmp[8192];
@@ -12845,7 +12907,11 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
-    if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
+    if (ok) {
+        req.raw_body = xstrndup(hr.body, hr.body_len);
+        req.kv_retention = s->kv_priority_mode == KV_CACHE_PRIORITY_MULTIAGENT ?
+            hr.kv_retention : DS4_KVSTORE_RETENTION_LEGACY;
+    }
     http_request_free(&hr);
     if (!ok) {
         http_error(fd, s->enable_cors, 400, err);
@@ -12943,6 +13009,7 @@ typedef struct {
     const char *kv_disk_dir;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
+    kv_cache_priority_mode kv_priority_mode;
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
@@ -13074,6 +13141,16 @@ static ds4_backend default_server_backend(void) {
 #endif
 }
 
+static kv_cache_priority_mode parse_kv_cache_priority_mode(const char *s,
+                                                           const char *arg) {
+    if (!strcmp(s, "none")) return KV_CACHE_PRIORITY_NONE;
+    if (!strcmp(s, "multiagent")) return KV_CACHE_PRIORITY_MULTIAGENT;
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: invalid %s value: %s (expected none or multiagent)",
+               arg, s);
+    exit(2);
+}
+
 static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
@@ -13175,6 +13252,11 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache.boundary_trim_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-boundary-align-tokens")) {
             c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-cache-priority")) {
+            c.kv_priority_mode = parse_kv_cache_priority_mode(
+                need_arg(&i, argc, argv, arg), arg);
+            c.kv_cache.prioritize_retention =
+                c.kv_priority_mode != KV_CACHE_PRIORITY_NONE;
         } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
             c.kv_cache_reject_different_quant = true;
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
@@ -13380,6 +13462,7 @@ int main(int argc, char **argv) {
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
+    s.kv_priority_mode = cfg.kv_priority_mode;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
@@ -13420,6 +13503,10 @@ int main(int argc, char **argv) {
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+    }
+    if (s.kv_priority_mode == KV_CACHE_PRIORITY_MULTIAGENT) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: KV cache priority multiagent enabled (X-DS4-Message-Origin: main|subagent)");
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -13622,6 +13709,25 @@ static void test_mixed_prefill_quantum_option(void) {
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
+}
+
+static void test_kv_cache_priority_option(void) {
+    char *default_argv[] = {"ds4-server"};
+    server_config defaults = parse_options(1, default_argv);
+    TEST_ASSERT(defaults.kv_priority_mode == KV_CACHE_PRIORITY_NONE);
+    TEST_ASSERT(!defaults.kv_cache.prioritize_retention);
+
+    char *multiagent_argv[] = {
+        "ds4-server", "--kv-cache-priority", "multiagent"
+    };
+    server_config multiagent = parse_options(3, multiagent_argv);
+    TEST_ASSERT(multiagent.kv_priority_mode == KV_CACHE_PRIORITY_MULTIAGENT);
+    TEST_ASSERT(multiagent.kv_cache.prioritize_retention);
+
+    char *none_argv[] = {"ds4-server", "--kv-cache-priority", "none"};
+    server_config none = parse_options(3, none_argv);
+    TEST_ASSERT(none.kv_priority_mode == KV_CACHE_PRIORITY_NONE);
+    TEST_ASSERT(!none.kv_cache.prioritize_retention);
 }
 
 static void test_batched_live_continuation_slot_binding(void) {
@@ -16929,6 +17035,26 @@ static void test_live_prefix_rewind_target(void) {
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
 }
 
+static void test_message_origin_header_retention(void) {
+    const char *main_header =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "X-DS4-Message-Origin: main\r\n\r\n";
+    const char *subagent_header =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "x-ds4-message-origin: SUBAGENT\r\n\r\n";
+    const char *unknown_header =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "X-DS4-Message-Origin: other\r\n\r\n";
+    TEST_ASSERT(message_retention(main_header, strlen(main_header)) ==
+                DS4_KVSTORE_RETENTION_FOREGROUND);
+    TEST_ASSERT(message_retention(subagent_header, strlen(subagent_header)) ==
+                DS4_KVSTORE_RETENTION_BACKGROUND);
+    TEST_ASSERT(message_retention(unknown_header, strlen(unknown_header)) ==
+                DS4_KVSTORE_RETENTION_FOREGROUND);
+    TEST_ASSERT(message_retention("Host: localhost\r\n", 17) ==
+                DS4_KVSTORE_RETENTION_FOREGROUND);
+}
+
 static void test_client_socket_nonblocking_flag(void) {
     int sv[2] = {-1, -1};
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -17413,9 +17539,11 @@ static void test_sha1_bytes_hex_matches_known_vector(void) {
     TEST_ASSERT(!strcmp(sha, "a9993e364706816aba3e25717850c26c9cd0d89d"));
 }
 
-static void test_kv_stub_file(const char *dir, const char *sha,
-                              uint8_t reason, uint32_t tokens, uint32_t hits,
-                              uint64_t last_used, uint64_t payload_bytes) {
+static void test_kv_stub_file_retention(const char *dir, const char *sha,
+                                        uint8_t reason, uint8_t retention,
+                                        uint32_t tokens, uint32_t hits,
+                                        uint64_t last_used,
+                                        uint64_t payload_bytes) {
     char name[44];
     snprintf(name, sizeof(name), "%.40s.kv", sha);
     char *path = path_join(dir, name);
@@ -17427,7 +17555,8 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     }
 
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    kv_fill_header(h, 2, reason, 0, tokens, hits, 32768, 100, last_used, payload_bytes);
+    kv_fill_header(h, 2, reason, retention, 0,
+                   tokens, hits, 32768, 100, last_used, payload_bytes);
     uint8_t text_len[4] = {0};
     TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
     TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
@@ -17436,6 +17565,110 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     }
     TEST_ASSERT(fclose(fp) == 0);
     free(path);
+}
+
+static void test_kv_stub_file(const char *dir, const char *sha,
+                              uint8_t reason, uint32_t tokens, uint32_t hits,
+                              uint64_t last_used, uint64_t payload_bytes) {
+    test_kv_stub_file_retention(dir, sha, reason,
+                                DS4_KVSTORE_RETENTION_LEGACY,
+                                tokens, hits, last_used, payload_bytes);
+}
+
+static void test_kv_cache_retention_header_promotes(void) {
+    char tmpl[] = "/tmp/ds4-kv-retention-header-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *sha = "1111111111111111111111111111111111111111";
+    test_kv_stub_file_retention(dir, sha, KV_REASON_COLD,
+                                DS4_KVSTORE_RETENTION_BACKGROUND,
+                                512, 0, 100, 64);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    ds4_kvstore_entry e = {0};
+    TEST_ASSERT(ds4_kvstore_read_entry_file(path, sha, &e));
+    TEST_ASSERT(e.retention == DS4_KVSTORE_RETENTION_BACKGROUND);
+    ds4_kvstore_entry_free(&e);
+
+    TEST_ASSERT(ds4_kvstore_touch_file(path, 7,
+                                       DS4_KVSTORE_RETENTION_FOREGROUND));
+    TEST_ASSERT(ds4_kvstore_read_entry_file(path, sha, &e));
+    TEST_ASSERT(e.hits == 7);
+    TEST_ASSERT(e.retention == DS4_KVSTORE_RETENTION_FOREGROUND);
+    ds4_kvstore_entry_free(&e);
+
+    TEST_ASSERT(ds4_kvstore_touch_file(path, 8,
+                                       DS4_KVSTORE_RETENTION_BACKGROUND));
+    TEST_ASSERT(ds4_kvstore_read_entry_file(path, sha, &e));
+    TEST_ASSERT(e.retention == DS4_KVSTORE_RETENTION_FOREGROUND);
+    ds4_kvstore_entry_free(&e);
+
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_retention_priority_is_optional(void) {
+    char tmpl[] = "/tmp/ds4-kv-retention-evict-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *background_sha = "1111111111111111111111111111111111111111";
+    const char *foreground_sha = "2222222222222222222222222222222222222222";
+    const char *stable_sha = "3333333333333333333333333333333333333333";
+    const uint64_t payload_bytes = 64;
+    const uint64_t file_bytes = KV_CACHE_FIXED_HEADER + 4u + payload_bytes;
+    test_kv_stub_file_retention(dir, background_sha, KV_REASON_COLD,
+                                DS4_KVSTORE_RETENTION_BACKGROUND,
+                                512, 0, 100, payload_bytes);
+    test_kv_stub_file_retention(dir, foreground_sha, KV_REASON_COLD,
+                                DS4_KVSTORE_RETENTION_FOREGROUND,
+                                512, 0, 100, payload_bytes);
+    test_kv_stub_file_retention(dir, stable_sha, KV_REASON_COLD,
+                                DS4_KVSTORE_RETENTION_STABLE_PREFIX,
+                                512, 0, 100, payload_bytes);
+
+    char *background_path = path_join(dir, "1111111111111111111111111111111111111111.kv");
+    char *foreground_path = path_join(dir, "2222222222222222222222222222222222222222.kv");
+    char *stable_path = path_join(dir, "3333333333333333333333333333333333333333.kv");
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.opt.prioritize_retention = true;
+    kc.budget_bytes = 2u * file_bytes;
+
+    TEST_ASSERT(kv_cache_evict(&kc, NULL, 0, NULL));
+    TEST_ASSERT(access(background_path, F_OK) != 0);
+    TEST_ASSERT(access(foreground_path, F_OK) == 0);
+    TEST_ASSERT(access(stable_path, F_OK) == 0);
+
+    ds4_kvstore_eviction_context incoming = {
+        .retention = DS4_KVSTORE_RETENTION_BACKGROUND,
+    };
+    TEST_ASSERT(!kv_cache_evict(&kc, NULL, file_bytes, &incoming));
+    TEST_ASSERT(access(foreground_path, F_OK) == 0);
+    TEST_ASSERT(access(stable_path, F_OK) == 0);
+
+    /* With the option disabled, the same header class has no effect and the
+     * original score-based eviction behavior remains active. */
+    kc.opt.prioritize_retention = false;
+    TEST_ASSERT(kv_cache_evict(&kc, NULL, file_bytes, &incoming));
+    TEST_ASSERT((access(foreground_path, F_OK) == 0) +
+                (access(stable_path, F_OK) == 0) == 1);
+
+    kv_cache_close(&kc);
+    unlink(background_path);
+    unlink(foreground_path);
+    unlink(stable_path);
+    free(background_path);
+    free(foreground_path);
+    free(stable_path);
+    rmdir(dir);
 }
 
 static void test_kv_text_stub_file_model(const char *dir, const char *text,
@@ -17455,8 +17688,9 @@ static void test_kv_text_stub_file_model(const char *dir, const char *text,
     }
 
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, 0,
-                            32768, 100, 100, payload_bytes);
+    ds4_kvstore_fill_header(h, model_id, 2, reason,
+                            DS4_KVSTORE_RETENTION_LEGACY, 0,
+                            tokens, 0, 32768, 100, 100, payload_bytes);
     uint8_t text_len[4];
     le_put32(text_len, (uint32_t)strlen(text));
     TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
@@ -17564,7 +17798,9 @@ static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
     TEST_ASSERT(fp != NULL);
     if (fp) {
         uint8_t h[KV_CACHE_FIXED_HEADER];
-        kv_fill_header(h, 2, KV_REASON_COLD, 0, 512, 0, 32768, 100, 100, 0);
+        kv_fill_header(h, 2, KV_REASON_COLD,
+                       DS4_KVSTORE_RETENTION_LEGACY, 0,
+                       512, 0, 32768, 100, 100, 0);
         h[20] = 0; /* pre-ABI-guard files used this byte as reserved zero. */
         uint8_t text_len[4];
         le_put32(text_len, (uint32_t)strlen(text));
@@ -17674,7 +17910,9 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     TEST_ASSERT(fp != NULL);
     if (fp) {
         uint8_t h[KV_CACHE_FIXED_HEADER];
-        kv_fill_header(h, 2, KV_REASON_CONTINUED, KV_EXT_TOOL_MAP, 512, 0, 32768, 100, 100, 0);
+        kv_fill_header(h, 2, KV_REASON_CONTINUED,
+                       DS4_KVSTORE_RETENTION_LEGACY, KV_EXT_TOOL_MAP,
+                       512, 0, 32768, 100, 100, 0);
         uint8_t text_len[4];
         le_put32(text_len, (uint32_t)strlen(text));
         TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
@@ -18311,6 +18549,7 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
+    test_kv_cache_priority_option();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
@@ -18402,6 +18641,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
     test_live_prefix_rewind_target();
+    test_message_origin_header_retention();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
     test_cancelled_progress_callback_is_inert();
@@ -18421,6 +18661,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
+    test_kv_cache_retention_header_promotes();
+    test_kv_cache_retention_priority_is_optional();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();

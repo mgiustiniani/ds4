@@ -1367,7 +1367,9 @@ The fixed header is little-endian:
 8   u32    cached token count
 12  u32    hit count
 16  u32    context size the snapshot was written for
-20  u8[4]  reserved
+20  u8     reserved
+21  u8     optional retention class
+22  u8[2]  reserved
 24  u64    creation Unix time
 32  u64    last-used Unix time
 40  u64    DS4 session payload byte count
@@ -1481,12 +1483,22 @@ tokens.
 - `--kv-cache-continued-interval-tokens`
 - `--kv-cache-boundary-trim-tokens`
 - `--kv-cache-boundary-align-tokens`
+- `--kv-cache-priority none|multiagent`
 - `--tool-memory-max-ids`
 - `--disable-exact-dsml-tool-replay`
 
 By default, checkpoints may be reused across the 2-bit and 4-bit routed-expert
 variants if the rendered prefix matches. Use `--kv-cache-reject-different-quant`
 when you want strict same-quant reuse only.
+
+Cache priority is opt-in. `--kv-cache-priority multiagent` reads the request
+header `X-DS4-Message-Origin`, whose supported values are `main` (the default)
+and `subagent`. It affects disk-cache retention only, never request scheduling.
+The stable agent/tool prefix before the task-specific user message has the
+highest retention, main conversation checkpoints are foreground, and subagent
+task checkpoints are background. Under disk pressure a background checkpoint
+cannot displace a foreground or stable-prefix checkpoint; without the option,
+DS4 retains its normal score-only eviction policy.
 
 The cache directory is disposable. If behavior looks suspicious, stop the
 server and remove it. You can investigate what is cached with hexdump as

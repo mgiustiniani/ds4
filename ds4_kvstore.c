@@ -168,6 +168,7 @@ ds4_kvstore_options ds4_kvstore_default_options(void) {
         .continued_interval_tokens = KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS,
         .boundary_trim_tokens = KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS,
         .boundary_align_tokens = KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS,
+        .prioritize_retention = false,
     };
 }
 
@@ -180,6 +181,38 @@ uint8_t ds4_kvstore_reason_code(const char *reason) {
     if (!strcmp(reason, "agent-system")) return DS4_KVSTORE_REASON_AGENT_SYSTEM;
     if (!strcmp(reason, "agent-session")) return DS4_KVSTORE_REASON_AGENT_SESSION;
     return DS4_KVSTORE_REASON_UNKNOWN;
+}
+
+static uint8_t kv_retention_sanitize(uint8_t retention) {
+    return retention <= DS4_KVSTORE_RETENTION_STABLE_PREFIX ?
+           retention : DS4_KVSTORE_RETENTION_LEGACY;
+}
+
+/* Legacy is deliberately between explicit background and foreground entries.
+ * This keeps old cache files useful while making delegated task checkpoints the
+ * first eviction candidates. */
+static int kv_retention_rank(uint8_t retention) {
+    switch (kv_retention_sanitize(retention)) {
+    case DS4_KVSTORE_RETENTION_BACKGROUND: return 0;
+    case DS4_KVSTORE_RETENTION_FOREGROUND: return 2;
+    case DS4_KVSTORE_RETENTION_STABLE_PREFIX: return 3;
+    default: return 1;
+    }
+}
+
+static uint8_t kv_retention_max(uint8_t a, uint8_t b) {
+    a = kv_retention_sanitize(a);
+    b = kv_retention_sanitize(b);
+    return kv_retention_rank(a) >= kv_retention_rank(b) ? a : b;
+}
+
+static const char *kv_retention_name(uint8_t retention) {
+    switch (kv_retention_sanitize(retention)) {
+    case DS4_KVSTORE_RETENTION_BACKGROUND: return "background";
+    case DS4_KVSTORE_RETENTION_FOREGROUND: return "foreground";
+    case DS4_KVSTORE_RETENTION_STABLE_PREFIX: return "stable-prefix";
+    default: return "legacy";
+    }
 }
 
 const char *ds4_kvstore_key_kind(uint8_t ext_flags) {
@@ -392,7 +425,8 @@ static void kv_cache_push(ds4_kvstore *kc, ds4_kvstore_entry e) {
 
 void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                              uint8_t model_id, uint8_t quant_bits,
-                             uint8_t reason, uint8_t ext_flags,
+                             uint8_t reason, uint8_t retention,
+                             uint8_t ext_flags,
                              uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                              uint64_t created_at, uint64_t last_used,
                              uint64_t payload_bytes) {
@@ -409,6 +443,7 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
     ds4_kvstore_le_put32(h + 12, hits);
     ds4_kvstore_le_put32(h + 16, ctx_size);
     h[20] = KV_CACHE_PAYLOAD_ABI;
+    h[21] = kv_retention_sanitize(retention);
     kv_le_put64(h + 24, created_at);
     kv_le_put64(h + 32, last_used);
     kv_le_put64(h + 40, payload_bytes);
@@ -426,6 +461,7 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
                 DS4_KVSTORE_REASON_UNKNOWN;
     e->ext_flags = h[6];
     e->model_id = h[7];
+    e->retention = kv_retention_sanitize(h[21]);
     e->tokens = ds4_kvstore_le_get32(h + 8);
     e->hits = ds4_kvstore_le_get32(h + 12);
     e->ctx_size = ds4_kvstore_le_get32(h + 16);
@@ -482,7 +518,8 @@ static void kv_cache_refresh(ds4_kvstore *kc) {
     closedir(d);
 }
 
-bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
+bool ds4_kvstore_touch_file(const char *path, uint32_t hits,
+                            uint8_t retention) {
     FILE *fp = fopen(path, "r+b");
     if (!fp) return false;
     ds4_kvstore_entry e = {0};
@@ -491,7 +528,9 @@ bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
     if (ok) {
         uint8_t h[DS4_KVSTORE_FIXED_HEADER];
         uint64_t now = (uint64_t)time(NULL);
-        ds4_kvstore_fill_header(h, e.model_id, e.quant_bits, e.reason, e.ext_flags,
+        retention = kv_retention_max(e.retention, retention);
+        ds4_kvstore_fill_header(h, e.model_id, e.quant_bits, e.reason,
+                                retention, e.ext_flags,
                                 e.tokens, hits, e.ctx_size,
                                 e.created_at, now, e.payload_bytes);
         ok = fseek(fp, 0, SEEK_SET) == 0 &&
@@ -558,52 +597,68 @@ double ds4_kvstore_entry_eviction_score(
     return score;
 }
 
-void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
+bool ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming) {
-    if (!kc->enabled || kc->budget_bytes == 0) return;
-    if (extra_bytes > kc->budget_bytes) return;
+    if (!kc->enabled || kc->budget_bytes == 0) return true;
+    if (extra_bytes > kc->budget_bytes) return false;
     kv_cache_refresh(kc);
     const uint64_t now = (uint64_t)time(NULL);
+    const bool prioritized = kc->opt.prioritize_retention;
+    const int incoming_rank = prioritized && incoming ?
+        kv_retention_rank(incoming->retention) : 0;
     uint64_t total = 0;
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
     const uint64_t target = kc->budget_bytes - extra_bytes;
     while (total > target && kc->len > 0) {
-        int victim = 0;
-        double victim_score =
-            ds4_kvstore_entry_eviction_score(&kc->entry[0], live, now,
-                                             incoming);
-        for (int i = 1; i < kc->len; i++) {
+        int victim = -1;
+        int victim_rank = 0;
+        double victim_score = 0.0;
+        for (int i = 0; i < kc->len; i++) {
+            const int rank = prioritized ?
+                kv_retention_rank(kc->entry[i].retention) : 0;
+            /* A new entry may replace only its own or a less durable class.
+             * Startup cleanup has no incoming entry and can consider all files. */
+            if (prioritized && incoming && rank > incoming_rank) continue;
             double score =
                 ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
                                                  incoming);
-            if (score < victim_score ||
-                (score == victim_score &&
-                 kc->entry[i].last_used < kc->entry[victim].last_used))
+            if (victim < 0 || rank < victim_rank ||
+                (rank == victim_rank &&
+                 (score < victim_score ||
+                  (score == victim_score &&
+                   kc->entry[i].last_used < kc->entry[victim].last_used))))
             {
                 victim = i;
+                victim_rank = rank;
                 victim_score = score;
             }
         }
-        ds4_kvstore_entry e = kc->entry[victim];
-        if (unlink(e.path) == 0) {
+        if (victim < 0) {
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                    "%s: kv cache evicted reason=disk-cache-full tokens=%u hits=%u size=%.2f MiB file=%s",
+                    "%s: kv cache admission skipped retention=%s because only higher-retention entries remain",
                     kv_log_name(kc),
-                    e.tokens,
-                    e.hits,
-                    (double)e.file_size / (1024.0 * 1024.0),
-                    e.path ? e.path : "?");
-            if (total >= e.file_size) total -= e.file_size;
-            else total = 0;
-        } else {
-            total = 0;
+                    incoming ? kv_retention_name(incoming->retention) : "none");
+            return false;
         }
+        ds4_kvstore_entry e = kc->entry[victim];
+        if (unlink(e.path) != 0) return false;
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache evicted reason=disk-cache-full retention=%s tokens=%u hits=%u size=%.2f MiB file=%s",
+                kv_log_name(kc),
+                kv_retention_name(e.retention),
+                e.tokens,
+                e.hits,
+                (double)e.file_size / (1024.0 * 1024.0),
+                e.path ? e.path : "?");
+        if (total >= e.file_size) total -= e.file_size;
+        else total = 0;
         ds4_kvstore_entry_free(&e);
         memmove(kc->entry + victim, kc->entry + victim + 1,
                 (size_t)(kc->len - victim - 1) * sizeof(kc->entry[0]));
         kc->len--;
     }
+    return total <= target;
 }
 
 bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
@@ -630,7 +685,9 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
     kc->opt = opt;
     ds4_kvstore_evict(kc, NULL, 0, NULL);
     kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-            "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
+            "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, "
+            "cold_max=%d, continued=%d, trim=%d, align=%d, "
+            "hit_half_life=%llus, priority=%s)",
             kv_log_name(kc),
             kc->dir,
             (unsigned long long)(kc->budget_bytes / (1024ull * 1024ull)),
@@ -640,7 +697,8 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
             kc->opt.continued_interval_tokens,
             kc->opt.boundary_trim_tokens,
             kc->opt.boundary_align_tokens,
-            (unsigned long long)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
+            (unsigned long long)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS,
+            kc->opt.prioritize_retention ? "on" : "off");
     return true;
 }
 
@@ -843,7 +901,8 @@ static bool kv_cache_file_text_matches(const char *path, const char sha[41],
 static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
                                          const char sha[41],
                                          const char *text, size_t text_len,
-                                         int model_id, int quant_bits, int ctx_size) {
+                                         int model_id, int quant_bits, int ctx_size,
+                                         uint8_t retention) {
     if (access(path, F_OK) != 0) return false;
     ds4_kvstore_entry e = {0};
     if (!ds4_kvstore_read_entry_file(path, sha, &e)) return false;
@@ -852,6 +911,7 @@ static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
                        e.quant_bits == (uint8_t)quant_bits) &&
                       e.ctx_size <= (uint32_t)ctx_size &&
                       kv_cache_file_text_matches(path, sha, text, text_len);
+    uint32_t hits = e.hits;
     ds4_kvstore_entry_free(&e);
     if (!compatible) {
         if (unlink(path) == 0) {
@@ -861,6 +921,7 @@ static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
         }
         return false;
     }
+    ds4_kvstore_touch_file(path, hits, retention);
     return true;
 }
 
@@ -907,6 +968,7 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
             uint8_t h[DS4_KVSTORE_FIXED_HEADER];
             uint64_t now = (uint64_t)time(NULL);
             ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason,
+                                    hdr.retention,
                                     (uint8_t)(hdr.ext_flags | hooks->ext_flag),
                                     hdr.tokens, hdr.hits, hdr.ctx_size,
                                     hdr.created_at, now, hdr.payload_bytes);
@@ -926,6 +988,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         const ds4_tokens *tokens,
                                         int store_len,
                                         const char *reason,
+                                        uint8_t retention,
                                         const char *cache_text_override,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
@@ -934,6 +997,8 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         size_t err_len) {
     if (!kc->enabled) return false;
     if (!tokens || store_len < kc->opt.min_tokens) return false;
+    retention = kc->opt.prioritize_retention ?
+        kv_retention_sanitize(retention) : DS4_KVSTORE_RETENTION_LEGACY;
     const int original_len = tokens->len;
 
     ds4_tokens store_tokens = {0};
@@ -995,8 +1060,8 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     const uint8_t reason_code = ds4_kvstore_reason_code(reason);
 
     if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
-                                     model_id,
-                                     quant_bits, ds4_session_ctx(session))) {
+                                     model_id, quant_bits,
+                                     ds4_session_ctx(session), retention)) {
         kv_cache_rewrite_trailer(kc, path, text, hooks);
         free(text);
         free(path);
@@ -1047,9 +1112,21 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .model_id = (uint8_t)model_id,
         .quant_bits = (uint8_t)quant_bits,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
+        .retention = retention,
         .reject_different_quant = kc->reject_different_quant,
     };
-    ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
+    if (!ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming)) {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache skipped tokens=%d reason=%s retention=%s "
+                "because admission would evict a higher-retention entry",
+                kv_log_name(kc), store_tokens.len, reason,
+                kv_retention_name(retention));
+        ds4_session_payload_file_free(&staged);
+        free(text);
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return false;
+    }
 
     kv_buf tmpb = {0};
     kv_buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
@@ -1074,7 +1151,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     uint8_t ext_flags = trailer_est_bytes > 0 && hooks ? hooks->ext_flag : 0;
     if (text_override) ext_flags |= cache_text_ext;
     ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
-                            reason_code, ext_flags,
+                            reason_code, retention, ext_flags,
                             (uint32_t)store_tokens.len, 0,
                             (uint32_t)ds4_session_ctx(session),
                             now, now, payload_bytes);
@@ -1137,11 +1214,12 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         unlink(tmp);
     } else {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache stored tokens=%d trimmed=%d reason=%s key=%s size=%.2f MiB save=%.1f ms",
+                "%s: kv cache stored tokens=%d trimmed=%d reason=%s retention=%s key=%s size=%.2f MiB save=%.1f ms",
                 kv_log_name(kc),
                 store_tokens.len,
                 original_len - store_tokens.len,
                 reason,
+                kv_retention_name(retention),
                 text_override ? (cache_text_key ? cache_text_key : "visible-transcript") : "token-text",
                 (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
                 save_ms);
@@ -1160,17 +1238,20 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    const ds4_tokens *tokens,
                                    int store_len,
                                    const char *reason,
+                                   uint8_t retention,
                                    const ds4_kvstore_trailer_hooks *hooks,
                                    char *err,
                                    size_t err_len) {
     return ds4_kvstore_store_live_prefix_text(kc, engine, session, tokens,
-                                              store_len, reason, NULL, 0, NULL,
+                                              store_len, reason, retention,
+                                              NULL, 0, NULL,
                                               hooks, err, err_len);
 }
 
 bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
                                        ds4_engine *engine,
                                        ds4_session *session,
+                                       uint8_t retention,
                                        const ds4_kvstore_trailer_hooks *hooks,
                                        char *err,
                                        size_t err_len) {
@@ -1179,7 +1260,8 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
     const int target = ds4_kvstore_continued_store_target(kc, tokens->len);
     if (target == 0) return false;
     if (ds4_kvstore_store_live_prefix(kc, engine, session, tokens, target,
-                                      "continued", hooks, err, err_len))
+                                      "continued", retention,
+                                      hooks, err, err_len))
     {
         ds4_kvstore_note_store(kc, target);
         return true;
@@ -1219,6 +1301,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_tokens *effective_prompt,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,
+                              uint8_t retention,
                               bool responses_protocol) {
     if (result) memset(result, 0, sizeof(*result));
     if (effective_prompt) effective_prompt->len = 0;
@@ -1318,13 +1401,15 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         const double load_ms = (kv_now_sec() - load_t0) * 1000.0;
         kc->continued_last_store_tokens = loaded;
         const char *key_kind = ds4_kvstore_key_kind(hdr.ext_flags);
-        ds4_kvstore_touch_file(path, hdr.hits + 1);
+        ds4_kvstore_touch_file(path, hdr.hits + 1, retention);
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
+                "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u retention=%s key=%s load=%.1f ms file=%s",
                 kv_log_name(kc),
                 responses_protocol ? " " : "",
                 responses_protocol ? "RESPPROTO" : "",
-                loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
+                loaded, text_bytes, hdr.quant_bits,
+                kv_retention_name(kv_retention_max(hdr.retention, retention)),
+                key_kind, load_ms, path);
         if (result) {
             result->tokens = loaded;
             result->text_bytes = text_bytes;
