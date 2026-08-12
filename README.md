@@ -1496,9 +1496,11 @@ header `X-DS4-Message-Origin`, whose supported values are `main` (the default)
 and `subagent`. It affects disk-cache retention only, never request scheduling.
 The stable agent/tool prefix before the task-specific user message has the
 highest retention, main conversation checkpoints are foreground, and subagent
-task checkpoints are background. Under disk pressure a background checkpoint
-cannot displace a foreground or stable-prefix checkpoint; without the option,
-DS4 retains its normal score-only eviction policy.
+task checkpoints are background. Under disk pressure DS4 drains background
+checkpoints first. If none remain, a background admission may replace the
+least-recently-used foreground checkpoint; legacy and stable-prefix checkpoints
+remain protected from this fallback. Without the option, DS4 retains its normal
+score-only eviction policy.
 
 The cache directory is disposable. If behavior looks suspicious, stop the
 server and remove it. You can investigate what is cached with hexdump as

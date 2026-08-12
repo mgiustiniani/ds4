@@ -614,11 +614,12 @@ bool ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
         int victim = -1;
         int victim_rank = 0;
         double victim_score = 0.0;
+        bool background_foreground_fallback = false;
         for (int i = 0; i < kc->len; i++) {
             const int rank = prioritized ?
                 kv_retention_rank(kc->entry[i].retention) : 0;
-            /* A new entry may replace only its own or a less durable class.
-             * Startup cleanup has no incoming entry and can consider all files. */
+            /* Prefer the incoming class and every less durable class. Startup
+             * cleanup has no incoming entry and can consider all files. */
             if (prioritized && incoming && rank > incoming_rank) continue;
             double score =
                 ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
@@ -634,14 +635,51 @@ bool ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                 victim_score = score;
             }
         }
+
+        /* A delegated checkpoint must not be starved forever after its class
+         * has been drained. Fall through only to parent/foreground checkpoints,
+         * oldest use first. Legacy entries and stable agent/tool prefixes remain
+         * protected from background admission. */
+        if (victim < 0 && prioritized && incoming &&
+            kv_retention_sanitize(incoming->retention) ==
+                DS4_KVSTORE_RETENTION_BACKGROUND)
+        {
+            uint64_t victim_used_at = 0;
+            for (int i = 0; i < kc->len; i++) {
+                if (kv_retention_sanitize(kc->entry[i].retention) !=
+                    DS4_KVSTORE_RETENTION_FOREGROUND) {
+                    continue;
+                }
+                const uint64_t used_at = kc->entry[i].last_used ?
+                    kc->entry[i].last_used : kc->entry[i].created_at;
+                if (victim < 0 || used_at < victim_used_at ||
+                    (used_at == victim_used_at &&
+                     kc->entry[i].created_at < kc->entry[victim].created_at))
+                {
+                    victim = i;
+                    victim_rank = kv_retention_rank(
+                        DS4_KVSTORE_RETENTION_FOREGROUND);
+                    victim_used_at = used_at;
+                }
+            }
+            background_foreground_fallback = victim >= 0;
+        }
         if (victim < 0) {
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                    "%s: kv cache admission skipped retention=%s because only higher-retention entries remain",
+                    "%s: kv cache admission skipped retention=%s because only protected higher-retention entries remain",
                     kv_log_name(kc),
                     incoming ? kv_retention_name(incoming->retention) : "none");
             return false;
         }
         ds4_kvstore_entry e = kc->entry[victim];
+        if (background_foreground_fallback) {
+            const uint64_t used_at = e.last_used ? e.last_used : e.created_at;
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache background admission fallback victim-retention=%s policy=oldest-foreground last-used=%llu",
+                    kv_log_name(kc),
+                    kv_retention_name(e.retention),
+                    (unsigned long long)used_at);
+        }
         if (unlink(e.path) != 0) return false;
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: kv cache evicted reason=disk-cache-full retention=%s tokens=%u hits=%u size=%.2f MiB file=%s",

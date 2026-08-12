@@ -17618,55 +17618,81 @@ static void test_kv_cache_retention_priority_is_optional(void) {
     if (!dir) return;
 
     const char *background_sha = "1111111111111111111111111111111111111111";
-    const char *foreground_sha = "2222222222222222222222222222222222222222";
-    const char *stable_sha = "3333333333333333333333333333333333333333";
+    const char *old_foreground_sha = "2222222222222222222222222222222222222222";
+    const char *new_foreground_sha = "3333333333333333333333333333333333333333";
+    const char *legacy_sha = "4444444444444444444444444444444444444444";
+    const char *stable_sha = "5555555555555555555555555555555555555555";
     const uint64_t payload_bytes = 64;
     const uint64_t file_bytes = KV_CACHE_FIXED_HEADER + 4u + payload_bytes;
     test_kv_stub_file_retention(dir, background_sha, KV_REASON_COLD,
                                 DS4_KVSTORE_RETENTION_BACKGROUND,
-                                512, 0, 100, payload_bytes);
-    test_kv_stub_file_retention(dir, foreground_sha, KV_REASON_COLD,
+                                512, 0, 50, payload_bytes);
+    test_kv_stub_file_retention(dir, old_foreground_sha, KV_REASON_COLD,
                                 DS4_KVSTORE_RETENTION_FOREGROUND,
                                 512, 0, 100, payload_bytes);
+    test_kv_stub_file_retention(dir, new_foreground_sha, KV_REASON_COLD,
+                                DS4_KVSTORE_RETENTION_FOREGROUND,
+                                512, 0, 200, payload_bytes);
+    test_kv_stub_file_retention(dir, legacy_sha, KV_REASON_COLD,
+                                DS4_KVSTORE_RETENTION_LEGACY,
+                                512, 0, 25, payload_bytes);
     test_kv_stub_file_retention(dir, stable_sha, KV_REASON_COLD,
                                 DS4_KVSTORE_RETENTION_STABLE_PREFIX,
-                                512, 0, 100, payload_bytes);
+                                512, 0, 10, payload_bytes);
 
     char *background_path = path_join(dir, "1111111111111111111111111111111111111111.kv");
-    char *foreground_path = path_join(dir, "2222222222222222222222222222222222222222.kv");
-    char *stable_path = path_join(dir, "3333333333333333333333333333333333333333.kv");
+    char *old_foreground_path = path_join(dir, "2222222222222222222222222222222222222222.kv");
+    char *new_foreground_path = path_join(dir, "3333333333333333333333333333333333333333.kv");
+    char *legacy_path = path_join(dir, "4444444444444444444444444444444444444444.kv");
+    char *stable_path = path_join(dir, "5555555555555555555555555555555555555555.kv");
     kv_disk_cache kc = {0};
     kc.enabled = true;
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.opt.prioritize_retention = true;
-    kc.budget_bytes = 2u * file_bytes;
+    kc.budget_bytes = 4u * file_bytes;
 
+    /* Normal cleanup drains background first. */
     TEST_ASSERT(kv_cache_evict(&kc, NULL, 0, NULL));
     TEST_ASSERT(access(background_path, F_OK) != 0);
-    TEST_ASSERT(access(foreground_path, F_OK) == 0);
-    TEST_ASSERT(access(stable_path, F_OK) == 0);
 
     ds4_kvstore_eviction_context incoming = {
         .retention = DS4_KVSTORE_RETENTION_BACKGROUND,
     };
-    TEST_ASSERT(!kv_cache_evict(&kc, NULL, file_bytes, &incoming));
-    TEST_ASSERT(access(foreground_path, F_OK) == 0);
+    /* Once background is exhausted, only the oldest foreground is eligible. */
+    TEST_ASSERT(kv_cache_evict(&kc, NULL, file_bytes, &incoming));
+    TEST_ASSERT(access(old_foreground_path, F_OK) != 0);
+    TEST_ASSERT(access(new_foreground_path, F_OK) == 0);
+    TEST_ASSERT(access(legacy_path, F_OK) == 0);
     TEST_ASSERT(access(stable_path, F_OK) == 0);
 
-    /* With the option disabled, the same header class has no effect and the
+    TEST_ASSERT(kv_cache_evict(&kc, NULL, 2u * file_bytes, &incoming));
+    TEST_ASSERT(access(new_foreground_path, F_OK) != 0);
+    TEST_ASSERT(access(legacy_path, F_OK) == 0);
+    TEST_ASSERT(access(stable_path, F_OK) == 0);
+
+    /* Legacy and stable-prefix remain protected from background fallback. */
+    TEST_ASSERT(!kv_cache_evict(&kc, NULL, 3u * file_bytes, &incoming));
+    TEST_ASSERT(access(legacy_path, F_OK) == 0);
+    TEST_ASSERT(access(stable_path, F_OK) == 0);
+
+    /* With the option disabled, retention classes have no effect and the
      * original score-based eviction behavior remains active. */
     kc.opt.prioritize_retention = false;
-    TEST_ASSERT(kv_cache_evict(&kc, NULL, file_bytes, &incoming));
-    TEST_ASSERT((access(foreground_path, F_OK) == 0) +
+    TEST_ASSERT(kv_cache_evict(&kc, NULL, 3u * file_bytes, &incoming));
+    TEST_ASSERT((access(legacy_path, F_OK) == 0) +
                 (access(stable_path, F_OK) == 0) == 1);
 
     kv_cache_close(&kc);
     unlink(background_path);
-    unlink(foreground_path);
+    unlink(old_foreground_path);
+    unlink(new_foreground_path);
+    unlink(legacy_path);
     unlink(stable_path);
     free(background_path);
-    free(foreground_path);
+    free(old_foreground_path);
+    free(new_foreground_path);
+    free(legacy_path);
     free(stable_path);
     rmdir(dir);
 }
