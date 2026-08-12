@@ -1504,8 +1504,12 @@ The stable agent/tool prefix before the task-specific user message has the
 highest retention, main conversation checkpoints are foreground, and subagent
 task checkpoints are background.
 
-An optional `X-DS4-Session-ID` associates foreground and background checkpoints
-with one durable conversation without storing the raw identifier. Its
+An optional `X-Session-Affinity` associates foreground and background checkpoints
+with one durable conversation without storing the raw identifier. Pi can emit
+its native durable session ID in this header with
+`compat.sendSessionAffinityHeaders=true` and
+`compat.sessionAffinityFormat="openai-nosession"`. Non-Pi clients may use the
+alias `X-DS4-Session-ID`; if both headers are present they must agree. The
 per-session checkpoint window precedes foreground/background ordering. Let `C`
 be the server context and `S` the sum of the session's existing non-stable
 checkpoint token counts. If `S <= C`, the next checkpoint is admitted intact

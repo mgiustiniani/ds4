@@ -12634,33 +12634,60 @@ static uint8_t message_retention(const char *h, size_t n) {
     return DS4_KVSTORE_RETENTION_FOREGROUND;
 }
 
-static bool message_session_sha(const char *h, size_t n, char out[41]) {
-    static const char name[] = "X-DS4-Session-ID:";
-    if (out) out[0] = '\0';
+static int message_header_value(const char *h, size_t n, const char *name,
+                                const char **value_out, size_t *len_out) {
+    if (value_out) *value_out = NULL;
+    if (len_out) *len_out = 0;
+    const size_t name_len = strlen(name);
     const char *p = h, *end = h + n;
+    bool found = false;
     while (p < end) {
         const char *line = p;
         while (p < end && *p != '\n') p++;
         const char *line_end = p;
         if (line_end > line && line_end[-1] == '\r') line_end--;
-        if ((size_t)(line_end - line) >= sizeof(name) - 1 &&
-            strncasecmp(line, name, sizeof(name) - 1) == 0)
+        if ((size_t)(line_end - line) >= name_len &&
+            strncasecmp(line, name, name_len) == 0)
         {
-            const char *value = line + sizeof(name) - 1;
+            if (found) return -1;
+            const char *value = line + name_len;
             while (value < line_end && isspace((unsigned char)*value)) value++;
             while (line_end > value && isspace((unsigned char)line_end[-1])) line_end--;
             const size_t len = (size_t)(line_end - value);
-            if (len == 0 || len > 256) return false;
+            if (len == 0 || len > 256) return -1;
             for (size_t i = 0; i < len; i++) {
                 const unsigned char c = (unsigned char)value[i];
-                if (c < 0x21 || c > 0x7e) return false;
+                if (c < 0x21 || c > 0x7e) return -1;
             }
-            ds4_kvstore_sha1_bytes_hex(value, len, out);
-            return true;
+            found = true;
+            if (value_out) *value_out = value;
+            if (len_out) *len_out = len;
         }
         if (p < end) p++;
     }
-    return false;
+    return found ? 1 : 0;
+}
+
+static bool message_session_sha(const char *h, size_t n, char out[41]) {
+    if (out) out[0] = '\0';
+    const char *explicit_value = NULL, *affinity_value = NULL;
+    size_t explicit_len = 0, affinity_len = 0;
+    const int explicit_state = message_header_value(
+        h, n, "X-DS4-Session-ID:", &explicit_value, &explicit_len);
+    const int affinity_state = message_header_value(
+        h, n, "X-Session-Affinity:", &affinity_value, &affinity_len);
+    if (explicit_state < 0 || affinity_state < 0) return false;
+    if (explicit_state == 0 && affinity_state == 0) return false;
+    if (explicit_state > 0 && affinity_state > 0 &&
+        (explicit_len != affinity_len ||
+         memcmp(explicit_value, affinity_value, explicit_len))) {
+        /* Conflicting provenance must never merge unrelated conversations. */
+        return false;
+    }
+    const char *value = explicit_state > 0 ? explicit_value : affinity_value;
+    const size_t len = explicit_state > 0 ? explicit_len : affinity_len;
+    ds4_kvstore_sha1_bytes_hex(value, len, out);
+    return true;
 }
 
 static bool read_http_request(int fd, http_request *r) {
@@ -13551,7 +13578,7 @@ int main(int argc, char **argv) {
     }
     if (s.kv_priority_mode == KV_CACHE_PRIORITY_MULTIAGENT) {
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: KV cache priority multiagent enabled (X-DS4-Message-Origin: main|subagent, optional X-DS4-Session-ID window)");
+                   "ds4-server: KV cache priority multiagent enabled (X-DS4-Message-Origin: main|subagent, optional X-Session-Affinity/X-DS4-Session-ID window)");
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -17102,10 +17129,32 @@ static void test_message_origin_header_retention(void) {
     const char *session_header =
         "POST /v1/chat/completions HTTP/1.1\r\n"
         "x-ds4-session-id: session-A_123\r\n\r\n";
+    const char *affinity_header =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "x-session-affinity: session-A_123\r\n\r\n";
+    const char *matching_headers =
+        "X-DS4-Session-ID: session-A_123\r\n"
+        "X-Session-Affinity: session-A_123\r\n";
+    const char *conflicting_headers =
+        "X-DS4-Session-ID: session-A_123\r\n"
+        "X-Session-Affinity: session-B_456\r\n";
+    const char *duplicate_headers =
+        "X-Session-Affinity: session-A_123\r\n"
+        "X-Session-Affinity: session-A_123\r\n";
     char got[41], expected[41];
     sha1_bytes_hex("session-A_123", strlen("session-A_123"), expected);
     TEST_ASSERT(message_session_sha(session_header, strlen(session_header), got));
     TEST_ASSERT(!strcmp(got, expected));
+    TEST_ASSERT(message_session_sha(affinity_header, strlen(affinity_header), got));
+    TEST_ASSERT(!strcmp(got, expected));
+    TEST_ASSERT(message_session_sha(matching_headers, strlen(matching_headers), got));
+    TEST_ASSERT(!strcmp(got, expected));
+    TEST_ASSERT(!message_session_sha(conflicting_headers,
+                                     strlen(conflicting_headers), got));
+    TEST_ASSERT(got[0] == '\0');
+    TEST_ASSERT(!message_session_sha(duplicate_headers,
+                                     strlen(duplicate_headers), got));
+    TEST_ASSERT(got[0] == '\0');
     TEST_ASSERT(!message_session_sha("Host: localhost\r\n", 17, got));
     TEST_ASSERT(got[0] == '\0');
     const char *invalid_session_header =
