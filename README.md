@@ -1352,6 +1352,7 @@ KVC fixed header, 48 bytes
 u32 rendered_text_bytes
 rendered_text_bytes of UTF-8-ish token text
 DS4 session payload, payload_bytes from the KVC header
+optional hashed session-id section
 optional tool-id map section
 ```
 
@@ -1362,7 +1363,7 @@ The fixed header is little-endian:
 3   u8     version = 1
 4   u8     routed expert quant bits, currently 2 or 4
 5   u8     save reason: 0 unknown, 1 cold, 2 continued, 3 evict, 4 shutdown
-6   u8     extension flags, bit 0 = appended tool-id map
+6   u8     extension flags, bit 0 = tool-id map, bit 4 = hashed session id
 7   u8     reserved
 8   u32    cached token count
 12  u32    hit count
@@ -1381,6 +1382,11 @@ the filename, and a file is reusable only when those bytes are a prefix of the
 incoming rendered prompt. After load, the exact checkpoint tokens from the DS4
 payload remain authoritative, and only the incoming text suffix after the cached
 bytes is tokenized.
+
+The optional session-id section is present only when header extension bit 4 is
+set. It appears immediately after the DS4 payload and contains `KSI`, version 1,
+and the 40 lowercase hexadecimal bytes of a SHA-1 digest. The raw HTTP session
+identifier is never persisted. Protocol-specific trailers follow this section.
 
 The optional tool-id map is present only when header extension bit 0 is set.
 Appended sections use fixed bit order, so future extension bits can add fields
@@ -1496,11 +1502,24 @@ header `X-DS4-Message-Origin`, whose supported values are `main` (the default)
 and `subagent`. It affects disk-cache retention only, never request scheduling.
 The stable agent/tool prefix before the task-specific user message has the
 highest retention, main conversation checkpoints are foreground, and subagent
-task checkpoints are background. Under disk pressure DS4 drains background
+task checkpoints are background.
+
+An optional `X-DS4-Session-ID` associates foreground and background checkpoints
+with one durable conversation without storing the raw identifier. Its
+per-session checkpoint window precedes foreground/background ordering. Let `C`
+be the server context and `S` the sum of the session's existing non-stable
+checkpoint token counts. If `S <= C`, the next checkpoint is admitted intact
+even when it crosses `C`. On the following checkpoint, when `S > C` before
+admission, DS4 removes least-recently-used checkpoints from that session until
+the following checkpoint fits within `C`. Several small checkpoints can
+therefore coexist, while one boundary-crossing checkpoint gets a single
+admission of grace. Stable prefixes and unscoped legacy files are excluded.
+
+After the session-window pass, normal disk pressure drains background
 checkpoints first. If none remain, a background admission may replace the
 least-recently-used foreground checkpoint; legacy and stable-prefix checkpoints
-remain protected from this fallback. Without the option, DS4 retains its normal
-score-only eviction policy.
+remain protected from this fallback. Without the priority option, session IDs
+and retention classes do not change the normal score-only eviction policy.
 
 The cache directory is disposable. If behavior looks suspicious, stop the
 server and remove it. You can investigate what is cached with hexdump as

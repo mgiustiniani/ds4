@@ -668,6 +668,7 @@ typedef struct {
     int cache_read_tokens;
     int cache_write_tokens;
     uint8_t kv_retention;
+    char kv_session_sha[DS4_KVSTORE_SESSION_SHA_HEX_BYTES + 1u];
     ds4_think_mode think_mode;
     bool has_tools;
     bool prompt_preserves_reasoning;
@@ -8433,6 +8434,7 @@ struct server_slot {
     visible_live_state thinking_live;
     int continued_last_store_tokens;
     uint8_t kv_retention;
+    char kv_session_sha[DS4_KVSTORE_SESSION_SHA_HEX_BYTES + 1u];
 
     job *assigned;
     job *running;
@@ -9368,6 +9370,12 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
         uint32_t text_bytes = 0;
         bool ok = kv_read_header(fp, &hdr, &text_bytes);
         uint64_t skip = (uint64_t)text_bytes + hdr.payload_bytes;
+        if (ok && (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_ID)) {
+            if (UINT64_MAX - skip < DS4_KVSTORE_SESSION_ID_SECTION_BYTES)
+                ok = false;
+            else
+                skip += DS4_KVSTORE_SESSION_ID_SECTION_BYTES;
+        }
         if (ok && hdr.model_id == model_id && (hdr.ext_flags & KV_EXT_TOOL_MAP) &&
             skip <= (uint64_t)INT64_MAX &&
             fseeko(fp, (off_t)skip, SEEK_CUR) == 0)
@@ -9519,6 +9527,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   slot->session,
                                                   tokens, store_len, reason,
                                                   retention,
+                                                  slot->kv_session_sha,
                                                   cache_text_override,
                                                   cache_text_ext,
                                                   cache_text_key,
@@ -11347,6 +11356,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     /* Any displaced live checkpoint was persisted above with its old class.
      * Stores produced by this request now inherit the incoming message class. */
     slot->kv_retention = j->req.kv_retention;
+    memcpy(slot->kv_session_sha, j->req.kv_session_sha,
+           sizeof(slot->kv_session_sha));
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
         ((!strcmp(cache_source, "responses-visible") ||
@@ -12562,6 +12573,7 @@ typedef struct {
     char *body;
     size_t body_len;
     uint8_t kv_retention;
+    char kv_session_sha[DS4_KVSTORE_SESSION_SHA_HEX_BYTES + 1u];
 } http_request;
 
 static void http_request_free(http_request *r) {
@@ -12622,6 +12634,35 @@ static uint8_t message_retention(const char *h, size_t n) {
     return DS4_KVSTORE_RETENTION_FOREGROUND;
 }
 
+static bool message_session_sha(const char *h, size_t n, char out[41]) {
+    static const char name[] = "X-DS4-Session-ID:";
+    if (out) out[0] = '\0';
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        const char *line_end = p;
+        if (line_end > line && line_end[-1] == '\r') line_end--;
+        if ((size_t)(line_end - line) >= sizeof(name) - 1 &&
+            strncasecmp(line, name, sizeof(name) - 1) == 0)
+        {
+            const char *value = line + sizeof(name) - 1;
+            while (value < line_end && isspace((unsigned char)*value)) value++;
+            while (line_end > value && isspace((unsigned char)line_end[-1])) line_end--;
+            const size_t len = (size_t)(line_end - value);
+            if (len == 0 || len > 256) return false;
+            for (size_t i = 0; i < len; i++) {
+                const unsigned char c = (unsigned char)value[i];
+                if (c < 0x21 || c > 0x7e) return false;
+            }
+            ds4_kvstore_sha1_bytes_hex(value, len, out);
+            return true;
+        }
+        if (p < end) p++;
+    }
+    return false;
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -12651,6 +12692,7 @@ static bool read_http_request(int fd, http_request *r) {
 
     long clen = content_length(b.ptr, (size_t)hend);
     r->kv_retention = message_retention(b.ptr, (size_t)hend);
+    (void)message_session_sha(b.ptr, (size_t)hend, r->kv_session_sha);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
     while (b.len < (size_t)hend + (size_t)clen) {
         char tmp[8192];
@@ -12911,6 +12953,9 @@ static void *client_main(void *arg) {
         req.raw_body = xstrndup(hr.body, hr.body_len);
         req.kv_retention = s->kv_priority_mode == KV_CACHE_PRIORITY_MULTIAGENT ?
             hr.kv_retention : DS4_KVSTORE_RETENTION_LEGACY;
+        if (s->kv_priority_mode == KV_CACHE_PRIORITY_MULTIAGENT)
+            memcpy(req.kv_session_sha, hr.kv_session_sha,
+                   sizeof(req.kv_session_sha));
     }
     http_request_free(&hr);
     if (!ok) {
@@ -13506,7 +13551,7 @@ int main(int argc, char **argv) {
     }
     if (s.kv_priority_mode == KV_CACHE_PRIORITY_MULTIAGENT) {
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: KV cache priority multiagent enabled (X-DS4-Message-Origin: main|subagent)");
+                   "ds4-server: KV cache priority multiagent enabled (X-DS4-Message-Origin: main|subagent, optional X-DS4-Session-ID window)");
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -17053,6 +17098,21 @@ static void test_message_origin_header_retention(void) {
                 DS4_KVSTORE_RETENTION_FOREGROUND);
     TEST_ASSERT(message_retention("Host: localhost\r\n", 17) ==
                 DS4_KVSTORE_RETENTION_FOREGROUND);
+
+    const char *session_header =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "x-ds4-session-id: session-A_123\r\n\r\n";
+    char got[41], expected[41];
+    sha1_bytes_hex("session-A_123", strlen("session-A_123"), expected);
+    TEST_ASSERT(message_session_sha(session_header, strlen(session_header), got));
+    TEST_ASSERT(!strcmp(got, expected));
+    TEST_ASSERT(!message_session_sha("Host: localhost\r\n", 17, got));
+    TEST_ASSERT(got[0] == '\0');
+    const char *invalid_session_header =
+        "X-DS4-Session-ID: invalid id\r\n";
+    TEST_ASSERT(!message_session_sha(invalid_session_header,
+                                     strlen(invalid_session_header), got));
+    TEST_ASSERT(got[0] == '\0');
 }
 
 static void test_client_socket_nonblocking_flag(void) {
@@ -17567,6 +17627,37 @@ static void test_kv_stub_file_retention(const char *dir, const char *sha,
     free(path);
 }
 
+static void test_kv_stub_file_session(const char *dir, const char *sha,
+                                      uint8_t reason, uint8_t retention,
+                                      uint32_t tokens, uint64_t last_used,
+                                      uint64_t payload_bytes,
+                                      const char *session_sha) {
+    test_kv_stub_file_retention(dir, sha, reason, retention,
+                                tokens, 0, last_used, payload_bytes);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    FILE *fp = fopen(path, "r+b");
+    TEST_ASSERT(fp != NULL);
+    if (!fp) {
+        free(path);
+        return;
+    }
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    kv_fill_header(h, 2, reason, retention,
+                   DS4_KVSTORE_EXT_SESSION_ID,
+                   tokens, 0, 32768, 100, last_used, payload_bytes);
+    TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+    TEST_ASSERT(fseeko(fp, 0, SEEK_END) == 0);
+    uint8_t section[DS4_KVSTORE_SESSION_ID_SECTION_BYTES] = {
+        'K', 'S', 'I', 1
+    };
+    memcpy(section + 4, session_sha, DS4_KVSTORE_SESSION_SHA_HEX_BYTES);
+    TEST_ASSERT(fwrite(section, 1, sizeof(section), fp) == sizeof(section));
+    TEST_ASSERT(fclose(fp) == 0);
+    free(path);
+}
+
 static void test_kv_stub_file(const char *dir, const char *sha,
                               uint8_t reason, uint32_t tokens, uint32_t hits,
                               uint64_t last_used, uint64_t payload_bytes) {
@@ -17694,6 +17785,148 @@ static void test_kv_cache_retention_priority_is_optional(void) {
     free(new_foreground_path);
     free(legacy_path);
     free(stable_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_session_window_allows_one_overshoot(void) {
+    char tmpl[] = "/tmp/ds4-kv-session-window-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    char session_a[41], session_b[41], session_c[41];
+    sha1_bytes_hex("session-a", strlen("session-a"), session_a);
+    sha1_bytes_hex("session-b", strlen("session-b"), session_b);
+    sha1_bytes_hex("session-c", strlen("session-c"), session_c);
+    const uint64_t payload_bytes = 64;
+    const char *a_old = "6111111111111111111111111111111111111111";
+    const char *a_mid = "6222222222222222222222222222222222222222";
+    const char *a_new = "6333333333333333333333333333333333333333";
+    const char *a_cross = "6444444444444444444444444444444444444444";
+    const char *b_old = "6555555555555555555555555555555555555555";
+    const char *a_stable = "6666666666666666666666666666666666666666";
+    test_kv_stub_file_session(dir, a_old, KV_REASON_COLD,
+                              DS4_KVSTORE_RETENTION_FOREGROUND,
+                              80, 100, payload_bytes, session_a);
+    test_kv_stub_file_session(dir, a_mid, KV_REASON_CONTINUED,
+                              DS4_KVSTORE_RETENTION_BACKGROUND,
+                              90, 200, payload_bytes, session_a);
+    test_kv_stub_file_session(dir, a_new, KV_REASON_EVICT,
+                              DS4_KVSTORE_RETENTION_FOREGROUND,
+                              60, 300, payload_bytes, session_a);
+    test_kv_stub_file_session(dir, b_old, KV_REASON_CONTINUED,
+                              DS4_KVSTORE_RETENTION_BACKGROUND,
+                              100, 1, payload_bytes, session_b);
+    test_kv_stub_file_session(dir, a_stable, KV_REASON_COLD,
+                              DS4_KVSTORE_RETENTION_STABLE_PREFIX,
+                              500, 1, payload_bytes, session_a);
+
+    char *a_old_path = path_join(dir, "6111111111111111111111111111111111111111.kv");
+    char *a_mid_path = path_join(dir, "6222222222222222222222222222222222222222.kv");
+    char *a_new_path = path_join(dir, "6333333333333333333333333333333333333333.kv");
+    char *a_cross_path = path_join(dir, "6444444444444444444444444444444444444444.kv");
+    char *b_old_path = path_join(dir, "6555555555555555555555555555555555555555.kv");
+    char *a_stable_path = path_join(dir, "6666666666666666666666666666666666666666.kv");
+
+    ds4_kvstore_entry persisted = {0};
+    TEST_ASSERT(ds4_kvstore_read_entry_file(a_mid_path, a_mid, &persisted));
+    TEST_ASSERT(!strcmp(persisted.session_sha, session_a));
+    TEST_ASSERT(persisted.ext_flags & DS4_KVSTORE_EXT_SESSION_ID);
+    ds4_kvstore_entry_free(&persisted);
+    TEST_ASSERT(ds4_kvstore_touch_file(
+        a_new_path, 7, DS4_KVSTORE_RETENTION_FOREGROUND));
+    TEST_ASSERT(ds4_kvstore_read_entry_file(a_new_path, a_new, &persisted));
+    TEST_ASSERT(persisted.hits == 7);
+    TEST_ASSERT(!strcmp(persisted.session_sha, session_a));
+    ds4_kvstore_entry_free(&persisted);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.opt.prioritize_retention = true;
+    kc.budget_bytes = 1024u * 1024u;
+    ds4_kvstore_eviction_context incoming = {
+        .ctx_size = 240,
+        .tokens = 40,
+        .retention = DS4_KVSTORE_RETENTION_BACKGROUND,
+    };
+    memcpy(incoming.session_sha, session_a, sizeof(incoming.session_sha));
+
+    /* Existing total is 230, so the checkpoint that crosses 240 gets one
+     * admission of grace. Retention class and another session's age do not
+     * affect this decision. */
+    TEST_ASSERT(kv_cache_evict(&kc, NULL, 0, &incoming));
+    TEST_ASSERT(access(a_old_path, F_OK) == 0);
+    TEST_ASSERT(access(a_mid_path, F_OK) == 0);
+    TEST_ASSERT(access(a_new_path, F_OK) == 0);
+    TEST_ASSERT(access(b_old_path, F_OK) == 0);
+    TEST_ASSERT(access(a_stable_path, F_OK) == 0);
+
+    test_kv_stub_file_session(dir, a_cross, KV_REASON_CONTINUED,
+                              DS4_KVSTORE_RETENTION_BACKGROUND,
+                              40, 400, payload_bytes, session_a);
+    incoming.tokens = 50;
+    /* The prior total is now 270. Before admitting the following checkpoint,
+     * evict the oldest same-session entry so 90+60+40+50 == 240. */
+    TEST_ASSERT(kv_cache_evict(&kc, NULL, 0, &incoming));
+    TEST_ASSERT(access(a_old_path, F_OK) != 0);
+    TEST_ASSERT(access(a_mid_path, F_OK) == 0);
+    TEST_ASSERT(access(a_new_path, F_OK) == 0);
+    TEST_ASSERT(access(a_cross_path, F_OK) == 0);
+    TEST_ASSERT(access(b_old_path, F_OK) == 0);
+    TEST_ASSERT(access(a_stable_path, F_OK) == 0);
+
+    /* If one victim is insufficient, continue in deterministic LRU order.
+     * Foreground/background are peers inside this session-window pass. */
+    const char *c1 = "6777777777777777777777777777777777777777";
+    const char *c2 = "6888888888888888888888888888888888888888";
+    const char *c3 = "6999999999999999999999999999999999999999";
+    test_kv_stub_file_session(dir, c1, KV_REASON_COLD,
+                              DS4_KVSTORE_RETENTION_FOREGROUND,
+                              70, 10, payload_bytes, session_c);
+    test_kv_stub_file_session(dir, c2, KV_REASON_CONTINUED,
+                              DS4_KVSTORE_RETENTION_BACKGROUND,
+                              80, 20, payload_bytes, session_c);
+    test_kv_stub_file_session(dir, c3, KV_REASON_EVICT,
+                              DS4_KVSTORE_RETENTION_FOREGROUND,
+                              100, 30, payload_bytes, session_c);
+    char *c1_path = path_join(dir, "6777777777777777777777777777777777777777.kv");
+    char *c2_path = path_join(dir, "6888888888888888888888888888888888888888.kv");
+    char *c3_path = path_join(dir, "6999999999999999999999999999999999999999.kv");
+    incoming.tokens = 200;
+    memcpy(incoming.session_sha, session_c, sizeof(incoming.session_sha));
+    TEST_ASSERT(kv_cache_evict(&kc, NULL, 0, &incoming));
+    TEST_ASSERT(access(c1_path, F_OK) != 0);
+    TEST_ASSERT(access(c2_path, F_OK) != 0);
+    TEST_ASSERT(access(c3_path, F_OK) != 0);
+
+    /* Priority mode none keeps the upstream score-only policy and never runs
+     * the per-session pass, even when the prior total is already over 240. */
+    const char *a_extra = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    test_kv_stub_file_session(dir, a_extra, KV_REASON_CONTINUED,
+                              DS4_KVSTORE_RETENTION_BACKGROUND,
+                              100, 500, payload_bytes, session_a);
+    char *a_extra_path = path_join(
+        dir, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.kv");
+    kc.opt.prioritize_retention = false;
+    incoming.tokens = 200;
+    memcpy(incoming.session_sha, session_a, sizeof(incoming.session_sha));
+    TEST_ASSERT(kv_cache_evict(&kc, NULL, 0, &incoming));
+    TEST_ASSERT(access(a_mid_path, F_OK) == 0);
+    TEST_ASSERT(access(a_new_path, F_OK) == 0);
+    TEST_ASSERT(access(a_cross_path, F_OK) == 0);
+    TEST_ASSERT(access(a_extra_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    const char *paths[] = {
+        a_old_path, a_mid_path, a_new_path, a_cross_path, a_extra_path,
+        b_old_path, a_stable_path, c1_path, c2_path, c3_path
+    };
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        unlink(paths[i]);
+        free((char *)paths[i]);
+    }
     rmdir(dir);
 }
 
@@ -17937,13 +18170,23 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     if (fp) {
         uint8_t h[KV_CACHE_FIXED_HEADER];
         kv_fill_header(h, 2, KV_REASON_CONTINUED,
-                       DS4_KVSTORE_RETENTION_LEGACY, KV_EXT_TOOL_MAP,
+                       DS4_KVSTORE_RETENTION_LEGACY,
+                       KV_EXT_TOOL_MAP | DS4_KVSTORE_EXT_SESSION_ID,
                        512, 0, 32768, 100, 100, 0);
         uint8_t text_len[4];
         le_put32(text_len, (uint32_t)strlen(text));
         TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
         TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
         TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
+        char session_sha[41];
+        sha1_bytes_hex("tool-map-session", strlen("tool-map-session"),
+                       session_sha);
+        uint8_t section[DS4_KVSTORE_SESSION_ID_SECTION_BYTES] = {
+            'K', 'S', 'I', 1
+        };
+        memcpy(section + 4, session_sha,
+               DS4_KVSTORE_SESSION_SHA_HEX_BYTES);
+        TEST_ASSERT(fwrite(section, 1, sizeof(section), fp) == sizeof(section));
         uint64_t ignored = 0;
         TEST_ASSERT(kv_tool_map_write(&src, fp, dsml, &ignored));
         TEST_ASSERT(fclose(fp) == 0);
@@ -18689,6 +18932,7 @@ static void ds4_server_unit_tests_run(void) {
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_retention_header_promotes();
     test_kv_cache_retention_priority_is_optional();
+    test_kv_cache_session_window_allows_one_overshoot();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();

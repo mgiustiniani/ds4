@@ -16,6 +16,13 @@
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
+#define DS4_KVSTORE_EXT_SESSION_ID        (1u << 4)
+
+/* Optional server session provenance is stored immediately after the session
+ * payload and before protocol-specific trailers.  Persist only a SHA-1 hex
+ * digest of the untrusted HTTP identifier, never the identifier itself. */
+#define DS4_KVSTORE_SESSION_SHA_HEX_BYTES 40u
+#define DS4_KVSTORE_SESSION_ID_SECTION_BYTES 44u
 
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
@@ -66,6 +73,7 @@ typedef struct {
     uint64_t payload_bytes;
     uint64_t text_bytes;
     uint64_t file_size;
+    char session_sha[DS4_KVSTORE_SESSION_SHA_HEX_BYTES + 1u];
 } ds4_kvstore_entry;
 
 typedef struct {
@@ -98,8 +106,10 @@ typedef struct {
     uint8_t model_id;
     uint8_t quant_bits;
     uint32_t ctx_size;
+    uint32_t tokens;
     uint8_t retention;
     bool reject_different_quant;
+    char session_sha[DS4_KVSTORE_SESSION_SHA_HEX_BYTES + 1u];
 } ds4_kvstore_eviction_context;
 
 typedef struct {
@@ -180,6 +190,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         int store_len,
                                         const char *reason,
                                         uint8_t retention,
+                                        const char *session_sha,
                                         const char *cache_text_override,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
@@ -193,6 +204,7 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    int store_len,
                                    const char *reason,
                                    uint8_t retention,
+                                   const char *session_sha,
                                    const ds4_kvstore_trailer_hooks *hooks,
                                    char *err,
                                    size_t err_len);
@@ -200,6 +212,7 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
                                        ds4_engine *engine,
                                        ds4_session *session,
                                        uint8_t retention,
+                                       const char *session_sha,
                                        const ds4_kvstore_trailer_hooks *hooks,
                                        char *err,
                                        size_t err_len);
