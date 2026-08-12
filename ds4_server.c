@@ -17837,17 +17837,23 @@ static void test_kv_cache_retention_priority_is_optional(void) {
     rmdir(dir);
 }
 
-static void test_kv_cache_session_window_allows_one_overshoot(void) {
+static void test_kv_cache_session_window_is_pressure_only(void) {
     char tmpl[] = "/tmp/ds4-kv-session-window-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
-    char session_a[41], session_b[41], session_c[41];
+    char session_a[41], session_b[41], session_c[41], session_d[41];
     sha1_bytes_hex("session-a", strlen("session-a"), session_a);
     sha1_bytes_hex("session-b", strlen("session-b"), session_b);
     sha1_bytes_hex("session-c", strlen("session-c"), session_c);
+    sha1_bytes_hex("session-d", strlen("session-d"), session_d);
     const uint64_t payload_bytes = 64;
+    const uint64_t scoped_file_bytes =
+        KV_CACHE_FIXED_HEADER + 4u + payload_bytes +
+        DS4_KVSTORE_SESSION_ID_SECTION_BYTES;
+    const uint64_t plain_file_bytes =
+        KV_CACHE_FIXED_HEADER + 4u + payload_bytes;
     const char *a_old = "6111111111111111111111111111111111111111";
     const char *a_mid = "6222222222222222222222222222222222222222";
     const char *a_new = "6333333333333333333333333333333333333333";
@@ -17865,7 +17871,7 @@ static void test_kv_cache_session_window_allows_one_overshoot(void) {
                               60, 300, payload_bytes, session_a);
     test_kv_stub_file_session(dir, b_old, KV_REASON_CONTINUED,
                               DS4_KVSTORE_RETENTION_BACKGROUND,
-                              100, 1, payload_bytes, session_b);
+                              1, 1, payload_bytes, session_b);
     test_kv_stub_file_session(dir, a_stable, KV_REASON_COLD,
                               DS4_KVSTORE_RETENTION_STABLE_PREFIX,
                               500, 1, payload_bytes, session_a);
@@ -17894,43 +17900,56 @@ static void test_kv_cache_session_window_allows_one_overshoot(void) {
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.opt.prioritize_retention = true;
-    kc.budget_bytes = 1024u * 1024u;
     ds4_kvstore_eviction_context incoming = {
         .ctx_size = 240,
-        .tokens = 40,
         .retention = DS4_KVSTORE_RETENTION_BACKGROUND,
     };
     memcpy(incoming.session_sha, session_a, sizeof(incoming.session_sha));
 
-    /* Existing total is 230, so the checkpoint that crosses 240 gets one
-     * admission of grace. Retention class and another session's age do not
-     * affect this decision. */
-    TEST_ASSERT(kv_cache_evict(&kc, NULL, 0, &incoming));
+    /* Session A currently has 230 tokens. Even if its incoming checkpoint will
+     * cross 240, it is not an over-context pressure victim yet. Normal class
+     * policy removes the very low-value background checkpoint from session B. */
+    kc.budget_bytes = 5u * scoped_file_bytes;
+    TEST_ASSERT(kv_cache_evict(&kc, NULL, scoped_file_bytes, &incoming));
+    TEST_ASSERT(access(b_old_path, F_OK) != 0);
     TEST_ASSERT(access(a_old_path, F_OK) == 0);
     TEST_ASSERT(access(a_mid_path, F_OK) == 0);
     TEST_ASSERT(access(a_new_path, F_OK) == 0);
-    TEST_ASSERT(access(b_old_path, F_OK) == 0);
     TEST_ASSERT(access(a_stable_path, F_OK) == 0);
 
     test_kv_stub_file_session(dir, a_cross, KV_REASON_CONTINUED,
                               DS4_KVSTORE_RETENTION_BACKGROUND,
                               40, 400, payload_bytes, session_a);
-    incoming.tokens = 50;
-    /* The prior total is now 270. Before admitting the following checkpoint,
-     * evict the oldest same-session entry so 90+60+40+50 == 240. */
-    TEST_ASSERT(kv_cache_evict(&kc, NULL, 0, &incoming));
+    /* Existing session total is now 270, but a roomy disk cache must preserve
+     * every checkpoint. The session rule is not an eager quota. */
+    kc.budget_bytes = 1024u * 1024u;
+    TEST_ASSERT(kv_cache_evict(&kc, NULL, scoped_file_bytes, &incoming));
+    TEST_ASSERT(access(a_old_path, F_OK) == 0);
+    TEST_ASSERT(access(a_mid_path, F_OK) == 0);
+    TEST_ASSERT(access(a_new_path, F_OK) == 0);
+    TEST_ASSERT(access(a_cross_path, F_OK) == 0);
+    TEST_ASSERT(access(a_stable_path, F_OK) == 0);
+
+    /* Under actual disk pressure, the oldest checkpoint from the over-context
+     * session wins before retention classes: foreground a_old is reclaimed
+     * before newer background a_mid/a_cross. Stable prefixes stay excluded. */
+    kc.budget_bytes = 5u * scoped_file_bytes;
+    TEST_ASSERT(kv_cache_evict(&kc, NULL, scoped_file_bytes, &incoming));
     TEST_ASSERT(access(a_old_path, F_OK) != 0);
     TEST_ASSERT(access(a_mid_path, F_OK) == 0);
     TEST_ASSERT(access(a_new_path, F_OK) == 0);
     TEST_ASSERT(access(a_cross_path, F_OK) == 0);
-    TEST_ASSERT(access(b_old_path, F_OK) == 0);
     TEST_ASSERT(access(a_stable_path, F_OK) == 0);
 
-    /* If one victim is insufficient, continue in deterministic LRU order.
-     * Foreground/background are peers inside this session-window pass. */
+    /* Pressure priority is global, not tied to the incoming session. Session D
+     * is reduced first because d1 is globally oldest; session C remains above
+     * 240 after c1, so c2 is the third deterministic victim. */
     const char *c1 = "6777777777777777777777777777777777777777";
     const char *c2 = "6888888888888888888888888888888888888888";
     const char *c3 = "6999999999999999999999999999999999999999";
+    const char *c4 = "6aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const char *d1 = "6bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const char *d2 = "6ccccccccccccccccccccccccccccccccccccccc";
     test_kv_stub_file_session(dir, c1, KV_REASON_COLD,
                               DS4_KVSTORE_RETENTION_FOREGROUND,
                               70, 10, payload_bytes, session_c);
@@ -17940,28 +17959,51 @@ static void test_kv_cache_session_window_allows_one_overshoot(void) {
     test_kv_stub_file_session(dir, c3, KV_REASON_EVICT,
                               DS4_KVSTORE_RETENTION_FOREGROUND,
                               100, 30, payload_bytes, session_c);
+    test_kv_stub_file_session(dir, c4, KV_REASON_CONTINUED,
+                              DS4_KVSTORE_RETENTION_BACKGROUND,
+                              120, 40, payload_bytes, session_c);
+    test_kv_stub_file_session(dir, d1, KV_REASON_COLD,
+                              DS4_KVSTORE_RETENTION_FOREGROUND,
+                              130, 5, payload_bytes, session_d);
+    test_kv_stub_file_session(dir, d2, KV_REASON_CONTINUED,
+                              DS4_KVSTORE_RETENTION_BACKGROUND,
+                              130, 50, payload_bytes, session_d);
     char *c1_path = path_join(dir, "6777777777777777777777777777777777777777.kv");
     char *c2_path = path_join(dir, "6888888888888888888888888888888888888888.kv");
     char *c3_path = path_join(dir, "6999999999999999999999999999999999999999.kv");
-    incoming.tokens = 200;
-    memcpy(incoming.session_sha, session_c, sizeof(incoming.session_sha));
-    TEST_ASSERT(kv_cache_evict(&kc, NULL, 0, &incoming));
+    char *c4_path = path_join(dir, "6aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.kv");
+    char *d1_path = path_join(dir, "6bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.kv");
+    char *d2_path = path_join(dir, "6ccccccccccccccccccccccccccccccccccccccc.kv");
+    memset(incoming.session_sha, 0, sizeof(incoming.session_sha));
+    kc.budget_bytes = 10u * scoped_file_bytes;
+    TEST_ASSERT(kv_cache_evict(&kc, NULL,
+                               3u * scoped_file_bytes, &incoming));
+    TEST_ASSERT(access(d1_path, F_OK) != 0);
     TEST_ASSERT(access(c1_path, F_OK) != 0);
     TEST_ASSERT(access(c2_path, F_OK) != 0);
-    TEST_ASSERT(access(c3_path, F_OK) != 0);
+    TEST_ASSERT(access(d2_path, F_OK) == 0);
+    TEST_ASSERT(access(c3_path, F_OK) == 0);
+    TEST_ASSERT(access(c4_path, F_OK) == 0);
+    TEST_ASSERT(access(a_stable_path, F_OK) == 0);
 
-    /* Priority mode none keeps the upstream score-only policy and never runs
-     * the per-session pass, even when the prior total is already over 240. */
+    /* Priority mode none stays score-only even when session A is over context.
+     * A one-token unscoped entry is the normal score victim; no session LRU
+     * preference runs. */
     const char *a_extra = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const char *score_victim = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     test_kv_stub_file_session(dir, a_extra, KV_REASON_CONTINUED,
                               DS4_KVSTORE_RETENTION_BACKGROUND,
                               100, 500, payload_bytes, session_a);
+    test_kv_stub_file(dir, score_victim, KV_REASON_UNKNOWN,
+                      1, 0, 1000, payload_bytes);
     char *a_extra_path = path_join(
         dir, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.kv");
+    char *score_victim_path = path_join(
+        dir, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.kv");
     kc.opt.prioritize_retention = false;
-    incoming.tokens = 200;
-    memcpy(incoming.session_sha, session_a, sizeof(incoming.session_sha));
-    TEST_ASSERT(kv_cache_evict(&kc, NULL, 0, &incoming));
+    kc.budget_bytes = 8u * scoped_file_bytes + plain_file_bytes;
+    TEST_ASSERT(kv_cache_evict(&kc, NULL, plain_file_bytes, &incoming));
+    TEST_ASSERT(access(score_victim_path, F_OK) != 0);
     TEST_ASSERT(access(a_mid_path, F_OK) == 0);
     TEST_ASSERT(access(a_new_path, F_OK) == 0);
     TEST_ASSERT(access(a_cross_path, F_OK) == 0);
@@ -17970,7 +18012,8 @@ static void test_kv_cache_session_window_allows_one_overshoot(void) {
     kv_cache_close(&kc);
     const char *paths[] = {
         a_old_path, a_mid_path, a_new_path, a_cross_path, a_extra_path,
-        b_old_path, a_stable_path, c1_path, c2_path, c3_path
+        b_old_path, a_stable_path, c1_path, c2_path, c3_path, c4_path,
+        d1_path, d2_path, score_victim_path
     };
     for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
         unlink(paths[i]);
@@ -18981,7 +19024,7 @@ static void ds4_server_unit_tests_run(void) {
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_retention_header_promotes();
     test_kv_cache_retention_priority_is_optional();
-    test_kv_cache_session_window_allows_one_overshoot();
+    test_kv_cache_session_window_is_pressure_only();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();

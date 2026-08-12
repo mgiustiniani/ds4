@@ -659,79 +659,68 @@ double ds4_kvstore_entry_eviction_score(
     return score;
 }
 
-static bool kv_session_window_entry(const ds4_kvstore_entry *e,
-                                    const char *session_sha) {
-    if (!e || !kv_session_sha_valid(session_sha) ||
-        strcmp(e->session_sha, session_sha)) {
-        return false;
-    }
+static bool kv_session_window_entry(const ds4_kvstore_entry *e) {
+    if (!e || !kv_session_sha_valid(e->session_sha)) return false;
     const uint8_t retention = kv_retention_sanitize(e->retention);
     return retention == DS4_KVSTORE_RETENTION_FOREGROUND ||
            retention == DS4_KVSTORE_RETENTION_BACKGROUND;
 }
 
-/* The configured context is a grace threshold, not an immediate hard cap.
- * When the existing session total is at or below the threshold, one new
- * checkpoint may cross it and remains intact.  Only the following checkpoint
- * observes an already-over-budget session; then prune least-recently-used
- * checkpoints until that following checkpoint will fit inside one context.
- * This rule deliberately precedes foreground/background class ordering. */
-static bool kv_cache_prune_session_window(
-        ds4_kvstore *kc,
-        const ds4_kvstore_eviction_context *incoming) {
-    if (!kc || !incoming || !kc->opt.prioritize_retention ||
-        !kv_session_sha_valid(incoming->session_sha) ||
-        incoming->ctx_size == 0 || incoming->tokens == 0) {
-        return true;
-    }
+static bool kv_session_window_same(const ds4_kvstore_entry *a,
+                                   const ds4_kvstore_entry *b) {
+    return kv_session_window_entry(a) && kv_session_window_entry(b) &&
+           !strcmp(a->session_sha, b->session_sha);
+}
 
-    uint64_t session_tokens = 0;
+/* This is a pressure-only preference, not an eager quota. If the incoming file
+ * already fits, ds4_kvstore_evict() never asks for a victim and every recovery
+ * point remains available. Once disk admission needs room, checkpoints from
+ * sessions whose existing cumulative tokens exceed one configured context are
+ * considered before foreground/background ranks. The oldest eligible entry is
+ * chosen globally; totals are recomputed after each removal so a session stops
+ * receiving this preference as soon as it is back at or below the threshold. */
+static int kv_cache_over_context_session_victim(
+        const ds4_kvstore *kc,
+        uint32_t context_tokens,
+        uint64_t *session_tokens_out,
+        bool *ok_out) {
+    if (session_tokens_out) *session_tokens_out = 0;
+    if (ok_out) *ok_out = true;
+    if (!kc || context_tokens == 0) return -1;
+
+    int victim = -1;
+    uint64_t victim_used_at = 0;
+    uint64_t victim_session_tokens = 0;
     for (int i = 0; i < kc->len; i++) {
-        if (!kv_session_window_entry(&kc->entry[i], incoming->session_sha))
-            continue;
-        if (UINT64_MAX - session_tokens < kc->entry[i].tokens) return false;
-        session_tokens += kc->entry[i].tokens;
-    }
-    if (session_tokens <= incoming->ctx_size) return true;
+        const ds4_kvstore_entry *candidate = &kc->entry[i];
+        if (!kv_session_window_entry(candidate)) continue;
 
-    const uint64_t target_existing = incoming->tokens < incoming->ctx_size ?
-        (uint64_t)incoming->ctx_size - incoming->tokens : 0;
-    const uint64_t previous_tokens = session_tokens;
-    while (session_tokens > target_existing) {
-        int victim = -1;
-        uint64_t victim_used_at = 0;
-        for (int i = 0; i < kc->len; i++) {
-            ds4_kvstore_entry *e = &kc->entry[i];
-            if (!kv_session_window_entry(e, incoming->session_sha)) continue;
-            const uint64_t used_at = e->last_used ? e->last_used : e->created_at;
-            if (victim < 0 || used_at < victim_used_at ||
-                (used_at == victim_used_at &&
-                 (e->created_at < kc->entry[victim].created_at ||
-                  (e->created_at == kc->entry[victim].created_at &&
-                   strcmp(e->sha, kc->entry[victim].sha) < 0)))) {
-                victim = i;
-                victim_used_at = used_at;
+        uint64_t session_tokens = 0;
+        for (int j = 0; j < kc->len; j++) {
+            if (!kv_session_window_same(candidate, &kc->entry[j])) continue;
+            if (UINT64_MAX - session_tokens < kc->entry[j].tokens) {
+                if (ok_out) *ok_out = false;
+                return -1;
             }
+            session_tokens += kc->entry[j].tokens;
         }
-        if (victim < 0) return false;
+        if (session_tokens <= context_tokens) continue;
 
-        ds4_kvstore_entry e = kc->entry[victim];
-        if (unlink(e.path) != 0) return false;
-        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache evicted reason=session-context-window policy=oldest-session session=%.12s retention=%s tokens=%u previous-total=%llu incoming=%u context=%u file=%s",
-                kv_log_name(kc), incoming->session_sha,
-                kv_retention_name(e.retention), e.tokens,
-                (unsigned long long)previous_tokens,
-                incoming->tokens, incoming->ctx_size,
-                e.path ? e.path : "?");
-        if (session_tokens >= e.tokens) session_tokens -= e.tokens;
-        else session_tokens = 0;
-        ds4_kvstore_entry_free(&e);
-        memmove(kc->entry + victim, kc->entry + victim + 1,
-                (size_t)(kc->len - victim - 1) * sizeof(kc->entry[0]));
-        kc->len--;
+        const uint64_t used_at = candidate->last_used ?
+            candidate->last_used : candidate->created_at;
+        if (victim < 0 || used_at < victim_used_at ||
+            (used_at == victim_used_at &&
+             (candidate->created_at < kc->entry[victim].created_at ||
+              (candidate->created_at == kc->entry[victim].created_at &&
+               strcmp(candidate->sha, kc->entry[victim].sha) < 0)))) {
+            victim = i;
+            victim_used_at = used_at;
+            victim_session_tokens = session_tokens;
+        }
     }
-    return true;
+    if (victim >= 0 && session_tokens_out)
+        *session_tokens_out = victim_session_tokens;
+    return victim;
 }
 
 bool ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
@@ -740,7 +729,6 @@ bool ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     if (!kc->enabled || kc->budget_bytes == 0) return true;
     if (extra_bytes > kc->budget_bytes) return false;
     kv_cache_refresh(kc);
-    if (!kv_cache_prune_session_window(kc, incoming)) return false;
     const uint64_t now = (uint64_t)time(NULL);
     const bool prioritized = kc->opt.prioritize_retention;
     const int incoming_rank = prioritized && incoming ?
@@ -753,24 +741,37 @@ bool ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
         int victim_rank = 0;
         double victim_score = 0.0;
         bool background_foreground_fallback = false;
-        for (int i = 0; i < kc->len; i++) {
-            const int rank = prioritized ?
-                kv_retention_rank(kc->entry[i].retention) : 0;
-            /* Prefer the incoming class and every less durable class. Startup
-             * cleanup has no incoming entry and can consider all files. */
-            if (prioritized && incoming && rank > incoming_rank) continue;
-            double score =
-                ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
-                                                 incoming);
-            if (victim < 0 || rank < victim_rank ||
-                (rank == victim_rank &&
-                 (score < victim_score ||
-                  (score == victim_score &&
-                   kc->entry[i].last_used < kc->entry[victim].last_used))))
-            {
-                victim = i;
-                victim_rank = rank;
-                victim_score = score;
+        bool over_context_session_victim = false;
+        uint64_t victim_session_tokens = 0;
+        if (prioritized && incoming && incoming->ctx_size > 0) {
+            bool session_totals_ok = true;
+            victim = kv_cache_over_context_session_victim(
+                kc, incoming->ctx_size, &victim_session_tokens,
+                &session_totals_ok);
+            if (!session_totals_ok) return false;
+            over_context_session_victim = victim >= 0;
+        }
+        if (victim < 0) {
+            for (int i = 0; i < kc->len; i++) {
+                const int rank = prioritized ?
+                    kv_retention_rank(kc->entry[i].retention) : 0;
+                /* Prefer the incoming class and every less durable class.
+                 * Startup cleanup has no incoming entry and can consider all
+                 * files. */
+                if (prioritized && incoming && rank > incoming_rank) continue;
+                double score =
+                    ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
+                                                     incoming);
+                if (victim < 0 || rank < victim_rank ||
+                    (rank == victim_rank &&
+                     (score < victim_score ||
+                      (score == victim_score &&
+                       kc->entry[i].last_used < kc->entry[victim].last_used))))
+                {
+                    victim = i;
+                    victim_rank = rank;
+                    victim_score = score;
+                }
             }
         }
 
@@ -810,7 +811,15 @@ bool ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
             return false;
         }
         ds4_kvstore_entry e = kc->entry[victim];
-        if (background_foreground_fallback) {
+        if (over_context_session_victim) {
+            const uint64_t used_at = e.last_used ? e.last_used : e.created_at;
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache pressure fallback policy=oldest-over-context-session session=%.12s session-tokens=%llu context=%u victim-retention=%s victim-tokens=%u last-used=%llu",
+                    kv_log_name(kc), e.session_sha,
+                    (unsigned long long)victim_session_tokens,
+                    incoming->ctx_size, kv_retention_name(e.retention),
+                    e.tokens, (unsigned long long)used_at);
+        } else if (background_foreground_fallback) {
             const uint64_t used_at = e.last_used ? e.last_used : e.created_at;
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                     "%s: kv cache background admission fallback victim-retention=%s policy=oldest-foreground last-used=%llu",
@@ -1311,7 +1320,6 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .model_id = (uint8_t)model_id,
         .quant_bits = (uint8_t)quant_bits,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
-        .tokens = (uint32_t)store_tokens.len,
         .retention = retention,
         .reject_different_quant = kc->reject_different_quant,
     };

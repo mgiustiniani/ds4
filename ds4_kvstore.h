@@ -106,7 +106,6 @@ typedef struct {
     uint8_t model_id;
     uint8_t quant_bits;
     uint32_t ctx_size;
-    uint32_t tokens;
     uint8_t retention;
     bool reject_different_quant;
     char session_sha[DS4_KVSTORE_SESSION_SHA_HEX_BYTES + 1u];

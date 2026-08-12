@@ -1510,20 +1510,22 @@ its native durable session ID in this header with
 `compat.sendSessionAffinityHeaders=true` and
 `compat.sessionAffinityFormat="openai-nosession"`. Non-Pi clients may use the
 alias `X-DS4-Session-ID`; if both headers are present they must agree. The
-per-session checkpoint window precedes foreground/background ordering. Let `C`
-be the server context and `S` the sum of the session's existing non-stable
-checkpoint token counts. If `S <= C`, the next checkpoint is admitted intact
-even when it crosses `C`. On the following checkpoint, when `S > C` before
-admission, DS4 removes least-recently-used checkpoints from that session until
-the following checkpoint fits within `C`. Several small checkpoints can
-therefore coexist, while one boundary-crossing checkpoint gets a single
-admission of grace. Stable prefixes and unscoped legacy files are excluded.
+per-session checkpoint window precedes foreground/background ordering only when
+a new file needs disk space. Let `C` be the server context and `S` the sum of a
+session's existing non-stable checkpoint token counts. While the file fits in
+the global cache, DS4 keeps every checkpoint even when `S > C`; this window is a
+pressure preference, not an eager quota. Under pressure, DS4 globally selects
+the least-recently-used checkpoint belonging to any session with `S > C`, then
+recomputes its total after each removal. A session stops receiving this first
+victim priority as soon as its retained total is at or below `C`. Stable
+prefixes and unscoped legacy files are excluded.
 
-After the session-window pass, normal disk pressure drains background
-checkpoints first. If none remain, a background admission may replace the
-least-recently-used foreground checkpoint; legacy and stable-prefix checkpoints
-remain protected from this fallback. Without the priority option, session IDs
-and retention classes do not change the normal score-only eviction policy.
+Once no over-context session offers a pressure victim, normal disk pressure
+drains background checkpoints first. If none remain, a background admission may
+replace the least-recently-used foreground checkpoint; legacy and stable-prefix
+checkpoints remain protected from this fallback. Without the priority option,
+session IDs and retention classes do not change the normal score-only eviction
+policy.
 
 The cache directory is disposable. If behavior looks suspicious, stop the
 server and remove it. You can investigate what is cached with hexdump as
