@@ -1034,6 +1034,7 @@ MTP speculative decoding is disabled while native session batching is active.
 
 Supported endpoints:
 
+- `GET /metrics` when `--metrics` is enabled
 - `GET /v1/models`
 - `GET /v1/models/deepseek-v4-flash`
 - `GET /v1/models/deepseek-v4-pro`
@@ -1088,6 +1089,43 @@ For browser JavaScript clients served from another origin, start the server with
 `--cors` to emit `Access-Control-Allow-*` headers. This only changes HTTP
 headers; it does not expose the server on the LAN. Use `--host 0.0.0.0`
 explicitly when remote machines should be able to connect.
+
+### Prometheus metrics
+
+Pass `--metrics` to expose a dependency-free Prometheus text endpoint at
+`GET /metrics`. Scraping reads relaxed atomic counters and never takes the
+inference lock, so monitoring remains available during long prefill or decode.
+The metric schema is shared by serial and resident-batched serving and reserves
+the `continuous` serving-mode value for a rolling continuous engine without
+changing dashboards later.
+
+The core counters separate actual prefill work from KV reuse and count decode
+rows independently from accelerator steps:
+
+```text
+ds4_prefill_tokens_total{kind="computed|cached"}
+ds4_decode_tokens_total
+ds4_decode_steps_total
+ds4_decode_batch_rows_total
+ds4_prefill_compute_seconds_total
+ds4_decode_compute_seconds_total
+ds4_scheduler_wait_seconds_total{phase="prefill|decode"}
+```
+
+Request-level histograms report time to first token, prefill duration, and
+decode duration. Labels are fixed and bounded; request IDs, session IDs, model
+paths, and cache keys are never labels. Useful PromQL expressions include:
+
+```promql
+rate(ds4_prefill_tokens_total{kind="computed"}[5m])
+rate(ds4_decode_tokens_total[5m])
+rate(ds4_prefill_tokens_total{kind="computed"}[5m])
+  / rate(ds4_prefill_compute_seconds_total[5m])
+rate(ds4_decode_tokens_total[5m])
+  / rate(ds4_decode_compute_seconds_total[5m])
+rate(ds4_decode_batch_rows_total[5m])
+  / rate(ds4_decode_steps_total[5m])
+```
 
 ### Tool call handling and canonicalization
 
