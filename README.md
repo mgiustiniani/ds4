@@ -1352,6 +1352,7 @@ KVC fixed header, 48 bytes
 u32 rendered_text_bytes
 rendered_text_bytes of UTF-8-ish token text
 DS4 session payload, payload_bytes from the KVC header
+optional hashed session-id section
 optional tool-id map section
 ```
 
@@ -1362,12 +1363,14 @@ The fixed header is little-endian:
 3   u8     version = 1
 4   u8     routed expert quant bits, currently 2 or 4
 5   u8     save reason: 0 unknown, 1 cold, 2 continued, 3 evict, 4 shutdown
-6   u8     extension flags, bit 0 = appended tool-id map
-7   u8     reserved
+6   u8     extension flags, bit 0 = tool-id map, bit 4 = hashed session id
+7   u8     model id (0 = Flash, 1 = Pro, 2 = GLM 5.2)
 8   u32    cached token count
 12  u32    hit count
 16  u32    context size the snapshot was written for
-20  u8[4]  reserved
+20  u8     session payload ABI
+21  u8     optional retention class
+22  u8[2]  reserved
 24  u64    creation Unix time
 32  u64    last-used Unix time
 40  u64    DS4 session payload byte count
@@ -1379,6 +1382,11 @@ the filename, and a file is reusable only when those bytes are a prefix of the
 incoming rendered prompt. After load, the exact checkpoint tokens from the DS4
 payload remain authoritative, and only the incoming text suffix after the cached
 bytes is tokenized.
+
+The optional session-id section is present only when header extension bit 4 is
+set. It appears immediately after the DS4 payload and contains `KSI`, version 1,
+and the 40 lowercase hexadecimal bytes of a SHA-1 digest. The raw HTTP session
+identifier is never persisted. Protocol-specific trailers follow this section.
 
 The optional tool-id map is present only when header extension bit 0 is set.
 Appended sections use fixed bit order, so future extension bits can add fields
@@ -1481,12 +1489,43 @@ tokens.
 - `--kv-cache-continued-interval-tokens`
 - `--kv-cache-boundary-trim-tokens`
 - `--kv-cache-boundary-align-tokens`
+- `--kv-cache-priority none|multiagent`
 - `--tool-memory-max-ids`
 - `--disable-exact-dsml-tool-replay`
 
 By default, checkpoints may be reused across the 2-bit and 4-bit routed-expert
 variants if the rendered prefix matches. Use `--kv-cache-reject-different-quant`
 when you want strict same-quant reuse only.
+
+Cache priority is opt-in. `--kv-cache-priority multiagent` reads the request
+header `X-DS4-Message-Origin`, whose supported values are `main` (the default)
+and `subagent`. It affects disk-cache retention only, never request scheduling.
+The stable agent/tool prefix before the task-specific user message has the
+highest retention, main conversation checkpoints are foreground, and subagent
+task checkpoints are background.
+
+An optional `X-Session-Affinity` associates foreground and background checkpoints
+with one durable conversation without storing the raw identifier. Pi can emit
+its native durable session ID in this header with
+`compat.sendSessionAffinityHeaders=true` and
+`compat.sessionAffinityFormat="openai-nosession"`. Non-Pi clients may use the
+alias `X-DS4-Session-ID`; if both headers are present they must agree. The
+per-session checkpoint window precedes foreground/background ordering only when
+a new file needs disk space. Let `C` be the server context and `S` the sum of a
+session's existing non-stable checkpoint token counts. While the file fits in
+the global cache, DS4 keeps every checkpoint even when `S > C`; this window is a
+pressure preference, not an eager quota. Under pressure, DS4 globally selects
+the least-recently-used checkpoint belonging to any session with `S > C`, then
+recomputes its total after each removal. A session stops receiving this first
+victim priority as soon as its retained total is at or below `C`. Stable
+prefixes and unscoped legacy files are excluded.
+
+Once no over-context session offers a pressure victim, normal disk pressure
+drains background checkpoints first. If none remain, a background admission may
+replace the least-recently-used foreground checkpoint; legacy and stable-prefix
+checkpoints remain protected from this fallback. Without the priority option,
+session IDs and retention classes do not change the normal score-only eviction
+policy.
 
 The cache directory is disposable. If behavior looks suspicious, stop the
 server and remove it. You can investigate what is cached with hexdump as
