@@ -5436,100 +5436,48 @@ static bool http_error(int fd, bool enable_cors, int code, const char *msg) {
     return ok;
 }
 
-static void append_metrics_histogram(
-        buf *b, const char *name,
-        const ds4_metrics_histogram_snapshot *histogram) {
-    static const char *labels[DS4_METRICS_LATENCY_BUCKETS] = {
+static void append_metrics_histogram(buf *b, const char *name,
+                                     ds4_histogram id) {
+    static const char *labels[] = {
         "0.1", "0.25", "0.5", "1", "2.5", "5",
         "10", "30", "60", "120", "300"
     };
     buf_printf(b, "# TYPE %s histogram\n", name);
-    for (int i = 0; i < DS4_METRICS_LATENCY_BUCKETS; i++) {
-        buf_printf(b, "%s_bucket{le=\"%s\"} %llu\n",
-                   name, labels[i],
-                   (unsigned long long)histogram->bucket[i]);
-    }
-    buf_printf(b, "%s_bucket{le=\"+Inf\"} %llu\n"
-                  "%s_sum %.9f\n"
-                  "%s_count %llu\n",
-               name, (unsigned long long)histogram->count,
-               name, (double)histogram->sum_ns / 1e9,
-               name, (unsigned long long)histogram->count);
+    for (int i = 0; i < DS4_METRICS_LATENCY_BUCKETS; i++)
+        buf_printf(b, "%s_bucket{le=\"%s\"} %llu\n", name, labels[i],
+                   (unsigned long long)ds4_histogram_read(id, i));
+    uint64_t count = ds4_histogram_read(id, DS4_METRICS_HIST_COUNT_INDEX);
+    buf_printf(b, "%s_bucket{le=\"+Inf\"} %llu\n%s_sum %.9f\n%s_count %llu\n",
+               name, (unsigned long long)count, name,
+               (double)ds4_histogram_read(id, DS4_METRICS_HIST_SUM_INDEX) / 1e9,
+               name, (unsigned long long)count);
 }
 
 static bool send_metrics(bool enable_cors, int fd) {
-    ds4_metrics_snapshot metrics;
-    ds4_metrics_snapshot_read(&metrics);
-    uint64_t now_ns = ds4_metrics_now_ns();
-    double uptime = now_ns >= metrics.boot_ns ?
-        (double)(now_ns - metrics.boot_ns) / 1e9 : 0.0;
+    typedef struct { const char *prefix; ds4_metric id; bool seconds; } sample;
+#define DS4_METRIC_SAMPLE(id, prefix, seconds) {prefix, DS4_M_##id, seconds},
+    static const sample samples[] = { DS4_METRIC_LIST(DS4_METRIC_SAMPLE) };
+#undef DS4_METRIC_SAMPLE
+    uint64_t now = ds4_metrics_now_ns();
+    double uptime = now >= ds4_metrics_boot_ns ?
+        (double)(now - ds4_metrics_boot_ns) / 1e9 : 0.0;
     buf b = {0};
-    buf_printf(&b,
-        "# TYPE ds4_server_info gauge\n"
-        "ds4_server_info{serving_mode=\"%s\"} 1\n"
-        "# TYPE ds4_uptime_seconds gauge\n"
-        "ds4_uptime_seconds %.3f\n"
-        "# TYPE ds4_resident_sessions gauge\n"
-        "ds4_resident_sessions %llu\n",
-        ds4_metrics_mode_name(metrics.mode), uptime,
-        (unsigned long long)metrics.resident_sessions);
-    buf_printf(&b,
-        "# TYPE ds4_requests_started_total counter\n"
-        "ds4_requests_started_total %llu\n"
-        "# TYPE ds4_requests_total counter\n"
-        "ds4_requests_total{outcome=\"completed\"} %llu\n"
-        "ds4_requests_total{outcome=\"failed\"} %llu\n"
-        "ds4_requests_total{outcome=\"cancelled\"} %llu\n"
-        "# TYPE ds4_requests_inflight gauge\n"
-        "ds4_requests_inflight %llu\n",
-        (unsigned long long)metrics.requests_started,
-        (unsigned long long)metrics.requests[DS4_METRICS_OUTCOME_COMPLETED],
-        (unsigned long long)metrics.requests[DS4_METRICS_OUTCOME_FAILED],
-        (unsigned long long)metrics.requests[DS4_METRICS_OUTCOME_CANCELLED],
-        (unsigned long long)metrics.requests_inflight);
-    buf_printf(&b,
-        "# TYPE ds4_prefill_tokens_total counter\n"
-        "ds4_prefill_tokens_total{kind=\"computed\"} %llu\n"
-        "ds4_prefill_tokens_total{kind=\"cached\"} %llu\n"
-        "# TYPE ds4_decode_tokens_total counter\n"
-        "ds4_decode_tokens_total %llu\n"
-        "# TYPE ds4_decode_steps_total counter\n"
-        "ds4_decode_steps_total %llu\n"
-        "# TYPE ds4_decode_batch_rows_total counter\n"
-        "ds4_decode_batch_rows_total %llu\n",
-        (unsigned long long)metrics.prefill_tokens_computed,
-        (unsigned long long)metrics.prefill_tokens_cached,
-        (unsigned long long)metrics.decode_tokens,
-        (unsigned long long)metrics.decode_steps,
-        (unsigned long long)metrics.decode_batch_rows);
-    buf_printf(&b,
-        "# TYPE ds4_prefill_compute_seconds_total counter\n"
-        "ds4_prefill_compute_seconds_total %.9f\n"
-        "# TYPE ds4_decode_compute_seconds_total counter\n"
-        "ds4_decode_compute_seconds_total %.9f\n"
-        "# TYPE ds4_phase_active gauge\n"
-        "ds4_phase_active{phase=\"prefill\"} %llu\n"
-        "ds4_phase_active{phase=\"decode\"} %llu\n"
-        "# TYPE ds4_phase_waiting gauge\n"
-        "ds4_phase_waiting{phase=\"prefill\"} %llu\n"
-        "ds4_phase_waiting{phase=\"decode\"} %llu\n"
-        "# TYPE ds4_scheduler_wait_seconds_total counter\n"
-        "ds4_scheduler_wait_seconds_total{phase=\"prefill\"} %.9f\n"
-        "ds4_scheduler_wait_seconds_total{phase=\"decode\"} %.9f\n",
-        (double)metrics.compute_ns[DS4_METRICS_PHASE_PREFILL] / 1e9,
-        (double)metrics.compute_ns[DS4_METRICS_PHASE_DECODE] / 1e9,
-        (unsigned long long)metrics.phase_active[DS4_METRICS_PHASE_PREFILL],
-        (unsigned long long)metrics.phase_active[DS4_METRICS_PHASE_DECODE],
-        (unsigned long long)metrics.phase_waiting[DS4_METRICS_PHASE_PREFILL],
-        (unsigned long long)metrics.phase_waiting[DS4_METRICS_PHASE_DECODE],
-        (double)metrics.scheduler_wait_ns[DS4_METRICS_PHASE_PREFILL] / 1e9,
-        (double)metrics.scheduler_wait_ns[DS4_METRICS_PHASE_DECODE] / 1e9);
-    append_metrics_histogram(&b, "ds4_time_to_first_token_seconds",
-                             &metrics.ttft);
-    append_metrics_histogram(&b, "ds4_prefill_request_duration_seconds",
-                             &metrics.prefill_request);
-    append_metrics_histogram(&b, "ds4_decode_request_duration_seconds",
-                             &metrics.decode_request);
+    buf_printf(&b, "# TYPE ds4_server_info gauge\nds4_server_info{serving_mode=\"%s\"} 1\n"
+                   "# TYPE ds4_uptime_seconds gauge\nds4_uptime_seconds %.3f\n"
+                   "# TYPE ds4_resident_sessions gauge\nds4_resident_sessions %llu\n",
+               ds4_metrics_mode_name(), uptime,
+               (unsigned long long)ds4_metrics_resident_sessions);
+    for (size_t i = 0; i < sizeof(samples) / sizeof(*samples); i++) {
+        uint64_t value = ds4_metric_read(samples[i].id);
+        if (samples[i].seconds)
+            buf_printf(&b, "%s %.9f\n", samples[i].prefix, (double)value / 1e9);
+        else
+            buf_printf(&b, "%s %llu\n", samples[i].prefix,
+                       (unsigned long long)value);
+    }
+    append_metrics_histogram(&b, "ds4_time_to_first_token_seconds", DS4_H_TTFT);
+    append_metrics_histogram(&b, "ds4_prefill_request_duration_seconds", DS4_H_PREFILL);
+    append_metrics_histogram(&b, "ds4_decode_request_duration_seconds", DS4_H_DECODE);
     bool ok = http_response(fd, enable_cors, 200,
                             "text/plain; version=0.0.4; charset=utf-8",
                             b.ptr ? b.ptr : "");
@@ -8559,6 +8507,7 @@ struct server {
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
     bool metrics_enabled;
+    int metrics_flush_tokens;
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
     pthread_mutex_t inference_mu;
@@ -8592,15 +8541,42 @@ struct job {
     bool done;
     bool cancelled;
     bool metrics_failed;
-    bool metrics_first_token_recorded;
-    bool metrics_prefill_recorded;
     uint64_t metrics_enqueued_ns;
+    uint64_t metrics_decode_tokens_pending;
     uint64_t metrics_prefill_started_ns;
     uint64_t metrics_decode_started_ns;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
 };
+
+#define METRICS_BEGIN(s, gauge, phase) ((s)->metrics_enabled ? \
+    ds4_metrics_phase_begin(gauge, phase) : 0)
+#define METRICS_END(s, gauge, total, phase, started) do { \
+    if ((s)->metrics_enabled) ds4_metrics_phase_end(gauge, total, phase, started); \
+} while (0)
+#define METRICS_PREFILL_END(s, started, tokens) do { if ((s)->metrics_enabled) { \
+    ds4_metrics_phase_end(DS4_M_ACTIVE_PREFILL, DS4_M_COMPUTE_PREFILL, \
+                          DS4_METRICS_PHASE_PREFILL, started); \
+    ds4_metric_add(DS4_M_PREFILL_COMPUTED, tokens); } \
+} while (0)
+#define METRICS_DECODE_END(s, started, rows, success) do { if ((s)->metrics_enabled) { \
+    ds4_metrics_phase_end(DS4_M_ACTIVE_PREFILL, DS4_M_COMPUTE_PREFILL, \
+                          DS4_METRICS_PHASE_DECODE, started); \
+    if (success) { ds4_metric_add(DS4_M_DECODE_STEPS, 1); \
+                   ds4_metric_add(DS4_M_DECODE_ROWS, rows); } } \
+} while (0)
+
+static void metrics_flush_decode_tokens(job *j) {
+    if (!j->metrics_decode_tokens_pending) return;
+    ds4_metric_add(DS4_M_DECODE_TOKENS, j->metrics_decode_tokens_pending);
+    j->metrics_decode_tokens_pending = 0;
+}
+
+static void metrics_record_decode_token(server *s, job *j) {
+    if (++j->metrics_decode_tokens_pending >= (uint64_t)s->metrics_flush_tokens)
+        metrics_flush_decode_tokens(j);
+}
 
 static bool job_cancelled(void *ud) {
     job *j = ud;
@@ -10525,13 +10501,12 @@ static int server_next_prefill_slot_locked(const server *s) {
 
 static bool server_prefill_enter(server *s, server_slot *slot) {
     if (!s || !slot || slot_job_cancelled(slot)) return false;
-    uint64_t wait_started = s->metrics_enabled ?
-        ds4_metrics_wait_begin(DS4_METRICS_PHASE_PREFILL) : 0;
+    uint64_t wait_started = METRICS_BEGIN(
+        s, DS4_M_WAITING_PREFILL, DS4_METRICS_PHASE_PREFILL);
     if (!s->batched_mode) {
         pthread_mutex_lock(&s->inference_mu);
-        if (s->metrics_enabled) {
-            ds4_metrics_wait_end(DS4_METRICS_PHASE_PREFILL, wait_started);
-        }
+        METRICS_END(s, DS4_M_WAITING_PREFILL, DS4_M_WAIT_PREFILL,
+                    DS4_METRICS_PHASE_PREFILL, wait_started);
         if (slot_job_cancelled(slot)) {
             pthread_mutex_unlock(&s->inference_mu);
             return false;
@@ -10547,9 +10522,8 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
             server_next_prefill_slot_locked(s) != slot->id)) {
         pthread_cond_wait(&s->model_cv, &s->model_mu);
     }
-    if (s->metrics_enabled) {
-        ds4_metrics_wait_end(DS4_METRICS_PHASE_PREFILL, wait_started);
-    }
+    METRICS_END(s, DS4_M_WAITING_PREFILL, DS4_M_WAIT_PREFILL,
+                DS4_METRICS_PHASE_PREFILL, wait_started);
     if (g_stop_requested || slot_job_cancelled(slot)) {
         slot->prefill_waiting = false;
         pthread_cond_broadcast(&s->model_cv);
@@ -10596,15 +10570,14 @@ static int server_session_sync(server *s, server_slot *slot,
     if (!s || !slot || !prompt) return 1;
     if (!s->batched_mode) {
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
-        int common = ds4_session_common_prefix(slot->session, prompt);
-        uint64_t compute_started = s->metrics_enabled ?
-            ds4_metrics_compute_begin(DS4_METRICS_PHASE_PREFILL) : 0;
+        int common = s->metrics_enabled ?
+            ds4_session_common_prefix(slot->session, prompt) : prompt->len;
+        uint64_t compute_started = METRICS_BEGIN(
+            s, DS4_M_ACTIVE_PREFILL, DS4_METRICS_PHASE_PREFILL);
         int rc = ds4_session_sync(slot->session, prompt, err, errlen);
-        if (s->metrics_enabled) {
-            uint64_t computed = rc == 0 && prompt->len > common ?
-                (uint64_t)(prompt->len - common) : 0;
-            ds4_metrics_prefill_compute_end(compute_started, computed);
-        }
+        uint64_t computed = rc == 0 && prompt->len > common ?
+            (uint64_t)(prompt->len - common) : 0;
+        METRICS_PREFILL_END(s, compute_started, computed);
         server_prefill_leave(s);
         return rc;
     }
@@ -10626,15 +10599,14 @@ static int server_session_sync(server *s, server_slot *slot,
         ds4_tokens prefix = *prompt;
         prefix.len = target;
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
-        int prefix_common = ds4_session_common_prefix(slot->session, &prefix);
-        uint64_t compute_started = s->metrics_enabled ?
-            ds4_metrics_compute_begin(DS4_METRICS_PHASE_PREFILL) : 0;
+        int prefix_common = s->metrics_enabled ?
+            ds4_session_common_prefix(slot->session, &prefix) : prefix.len;
+        uint64_t compute_started = METRICS_BEGIN(
+            s, DS4_M_ACTIVE_PREFILL, DS4_METRICS_PHASE_PREFILL);
         int rc = ds4_session_sync(slot->session, &prefix, err, errlen);
-        if (s->metrics_enabled) {
-            uint64_t computed = rc == 0 && prefix.len > prefix_common ?
-                (uint64_t)(prefix.len - prefix_common) : 0;
-            ds4_metrics_prefill_compute_end(compute_started, computed);
-        }
+        uint64_t computed = rc == 0 && prefix.len > prefix_common ?
+            (uint64_t)(prefix.len - prefix_common) : 0;
+        METRICS_PREFILL_END(s, compute_started, computed);
         if (rc == 0) done = ds4_session_pos(slot->session);
         server_prefill_leave(s);
         called = true;
@@ -11128,9 +11100,10 @@ static bool server_cancel_pending_decode_locked(server *s, server_slot *slot) {
     if (!s || !slot || !slot->decode_pending || slot->decode_in_flight) return false;
     slot->decode_pending = false;
     s->decode_pending--;
-    if (s->metrics_enabled && slot->metrics_decode_wait_started_ns) {
-        ds4_metrics_wait_end(DS4_METRICS_PHASE_DECODE,
-                             slot->metrics_decode_wait_started_ns);
+    if (slot->metrics_decode_wait_started_ns) {
+        ds4_metrics_phase_end(DS4_M_WAITING_PREFILL, DS4_M_WAIT_PREFILL,
+                              DS4_METRICS_PHASE_DECODE,
+                              slot->metrics_decode_wait_started_ns);
         slot->metrics_decode_wait_started_ns = 0;
     }
     slot->decode_rc = DS4_SESSION_SYNC_INTERRUPTED;
@@ -11150,29 +11123,25 @@ static int server_eval_token(server *s, server_slot *slot, int token,
                                                            "client disconnected");
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
-        uint64_t wait_started = s->metrics_enabled ?
-            ds4_metrics_wait_begin(DS4_METRICS_PHASE_DECODE) : 0;
+        uint64_t wait_started = METRICS_BEGIN(
+            s, DS4_M_WAITING_PREFILL, DS4_METRICS_PHASE_DECODE);
         pthread_mutex_lock(&s->inference_mu);
-        if (s->metrics_enabled) {
-            ds4_metrics_wait_end(DS4_METRICS_PHASE_DECODE, wait_started);
-        }
-        uint64_t compute_started = s->metrics_enabled ?
-            ds4_metrics_compute_begin(DS4_METRICS_PHASE_DECODE) : 0;
+        METRICS_END(s, DS4_M_WAITING_PREFILL, DS4_M_WAIT_PREFILL,
+                    DS4_METRICS_PHASE_DECODE, wait_started);
+        uint64_t compute_started = METRICS_BEGIN(
+            s, DS4_M_ACTIVE_PREFILL, DS4_METRICS_PHASE_DECODE);
         int rc = ds4_session_eval(slot->session, token, err, errlen);
-        if (s->metrics_enabled) {
-            ds4_metrics_decode_compute_end(compute_started, 1, rc == 0);
-        }
+        METRICS_DECODE_END(s, compute_started, 1, rc == 0);
         pthread_mutex_unlock(&s->inference_mu);
         return rc;
     }
 
-    uint64_t wait_started = s->metrics_enabled ?
-        ds4_metrics_wait_begin(DS4_METRICS_PHASE_DECODE) : 0;
+    uint64_t wait_started = METRICS_BEGIN(
+        s, DS4_M_WAITING_PREFILL, DS4_METRICS_PHASE_DECODE);
     pthread_mutex_lock(&s->model_mu);
     if (g_stop_requested || slot_job_cancelled(slot)) {
-        if (s->metrics_enabled) {
-            ds4_metrics_wait_end(DS4_METRICS_PHASE_DECODE, wait_started);
-        }
+        METRICS_END(s, DS4_M_WAITING_PREFILL, DS4_M_WAIT_PREFILL,
+                    DS4_METRICS_PHASE_DECODE, wait_started);
         pthread_mutex_unlock(&s->model_mu);
         if (err && errlen) snprintf(err, errlen, "%s",
                                     g_stop_requested ? "shutdown requested" :
@@ -11180,9 +11149,8 @@ static int server_eval_token(server *s, server_slot *slot, int token,
         return DS4_SESSION_SYNC_INTERRUPTED;
     }
     if (slot->decode_pending || slot->decode_in_flight) {
-        if (s->metrics_enabled) {
-            ds4_metrics_wait_end(DS4_METRICS_PHASE_DECODE, wait_started);
-        }
+        METRICS_END(s, DS4_M_WAITING_PREFILL, DS4_M_WAIT_PREFILL,
+                    DS4_METRICS_PHASE_DECODE, wait_started);
         pthread_mutex_unlock(&s->model_mu);
         if (err && errlen) snprintf(err, errlen, "session already has a decode in flight");
         return 1;
@@ -11281,9 +11249,10 @@ static void *decode_worker_main(void *arg) {
             slot->decode_pending = false;
             slot->decode_in_flight = true;
             s->decode_pending--;
-            if (s->metrics_enabled && slot->metrics_decode_wait_started_ns) {
-                ds4_metrics_wait_end(DS4_METRICS_PHASE_DECODE,
-                                     slot->metrics_decode_wait_started_ns);
+            if (slot->metrics_decode_wait_started_ns) {
+                ds4_metrics_phase_end(DS4_M_WAITING_PREFILL,
+                    DS4_M_WAIT_PREFILL, DS4_METRICS_PHASE_DECODE,
+                    slot->metrics_decode_wait_started_ns);
                 slot->metrics_decode_wait_started_ns = 0;
             }
             members[count] = slot;
@@ -11298,14 +11267,11 @@ static void *decode_worker_main(void *arg) {
         char batch_err[160] = {0};
         const double batch_t0 = log_batches ? now_sec() : 0.0;
         pthread_mutex_lock(&s->inference_mu);
-        uint64_t compute_started = s->metrics_enabled ?
-            ds4_metrics_compute_begin(DS4_METRICS_PHASE_DECODE) : 0;
+        uint64_t compute_started = METRICS_BEGIN(
+            s, DS4_M_ACTIVE_PREFILL, DS4_METRICS_PHASE_DECODE);
         int rc = ds4_sessions_eval_batch(items, count,
                                          batch_err, sizeof(batch_err));
-        if (s->metrics_enabled) {
-            ds4_metrics_decode_compute_end(compute_started,
-                                           (uint64_t)count, rc == 0);
-        }
+        METRICS_DECODE_END(s, compute_started, (uint64_t)count, rc == 0);
         pthread_mutex_unlock(&s->inference_mu);
         if (log_batches) {
             server_log(DS4_LOG_DEFAULT,
@@ -11512,7 +11478,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     const double t0 = now_sec();
     if (s->metrics_enabled) {
         j->metrics_prefill_started_ns = ds4_metrics_now_ns();
-        if (cached > 0) ds4_metrics_prefill_cached_add((uint64_t)cached);
+        ds4_metric_add(DS4_M_PREFILL_CACHED, (uint64_t)cached);
     }
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
@@ -11686,11 +11652,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                req_flags[0] ? " " : "",
                req_flags,
                now_sec() - t0);
-    if (s->metrics_enabled && j->metrics_prefill_started_ns &&
-        !j->metrics_prefill_recorded) {
-        ds4_metrics_observe_prefill_request(
-            ds4_metrics_now_ns() - j->metrics_prefill_started_ns);
-        j->metrics_prefill_recorded = true;
+    if (s->metrics_enabled && j->metrics_prefill_started_ns) {
+        ds4_metrics_histogram_observe(
+            DS4_H_PREFILL, ds4_metrics_now_ns() - j->metrics_prefill_started_ns);
+        j->metrics_prefill_started_ns = 0;
     }
     if (cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
@@ -11856,8 +11821,8 @@ decode_again:
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
-            uint64_t compute_started = s->metrics_enabled ?
-                ds4_metrics_compute_begin(DS4_METRICS_PHASE_DECODE) : 0;
+            uint64_t compute_started = METRICS_BEGIN(
+                s, DS4_M_ACTIVE_PREFILL, DS4_METRICS_PHASE_DECODE);
             ntok = ds4_session_eval_speculative_argmax(slot->session,
                                                        token,
                                                        max_tokens - completion,
@@ -11866,9 +11831,7 @@ decode_again:
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
                                                        err,
                                                        sizeof(err));
-            if (s->metrics_enabled) {
-                ds4_metrics_decode_compute_end(compute_started, 1, ntok >= 0);
-            }
+            METRICS_DECODE_END(s, compute_started, 1, ntok >= 0);
             if (ntok < 0) {
                 finish = "error";
                 break;
@@ -11901,12 +11864,11 @@ decode_again:
             char *piece = ds4_token_text(s->engine, token, &piece_len);
             completion++;
             if (s->metrics_enabled) {
-                ds4_metrics_decode_tokens_add(1);
-                if (!j->metrics_first_token_recorded &&
-                    j->metrics_enqueued_ns) {
-                    ds4_metrics_observe_ttft(
-                        ds4_metrics_now_ns() - j->metrics_enqueued_ns);
-                    j->metrics_first_token_recorded = true;
+                metrics_record_decode_token(s, j);
+                if (j->metrics_enqueued_ns) {
+                    ds4_metrics_histogram_observe(
+                        DS4_H_TTFT, ds4_metrics_now_ns() - j->metrics_enqueued_ns);
+                    j->metrics_enqueued_ns = 0;
                 }
             }
 
@@ -12562,21 +12524,20 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     ds4_session_set_cancel(slot->session, NULL, NULL);
 
     if (s->metrics_enabled) {
-        uint64_t now_ns = ds4_metrics_now_ns();
-        if (j->metrics_prefill_started_ns && !j->metrics_prefill_recorded) {
-            ds4_metrics_observe_prefill_request(
-                now_ns - j->metrics_prefill_started_ns);
-            j->metrics_prefill_recorded = true;
-        }
-        if (j->metrics_decode_started_ns) {
-            ds4_metrics_observe_decode_request(
-                now_ns - j->metrics_decode_started_ns);
-        }
+        metrics_flush_decode_tokens(j);
+        uint64_t now = ds4_metrics_now_ns();
+        if (j->metrics_prefill_started_ns)
+            ds4_metrics_histogram_observe(
+                DS4_H_PREFILL, now - j->metrics_prefill_started_ns);
+        if (j->metrics_decode_started_ns)
+            ds4_metrics_histogram_observe(
+                DS4_H_DECODE, now - j->metrics_decode_started_ns);
         ds4_metrics_outcome outcome = job_cancelled(j) ?
             DS4_METRICS_OUTCOME_CANCELLED :
             (j->metrics_failed ? DS4_METRICS_OUTCOME_FAILED :
                                  DS4_METRICS_OUTCOME_COMPLETED);
-        ds4_metrics_request_finished(outcome);
+        ds4_metric_add((ds4_metric)(DS4_M_REQUEST_COMPLETED + outcome), 1);
+        ds4_metric_sub(DS4_M_REQUESTS_INFLIGHT);
     }
 
     pthread_mutex_lock(&s->model_mu);
@@ -12676,7 +12637,11 @@ static bool enqueue(server *s, job *j) {
     }
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
-    if (s->metrics_enabled) ds4_metrics_request_started();
+    if (s->metrics_enabled) {
+        j->metrics_enqueued_ns = ds4_metrics_now_ns();
+        ds4_metric_add(DS4_M_REQUESTS_STARTED, 1);
+        ds4_metric_add(DS4_M_REQUESTS_INFLIGHT, 1);
+    }
     if (s->batched_mode) {
         dispatch_jobs_locked(s);
         pthread_cond_broadcast(&s->cv);
@@ -13091,7 +13056,6 @@ static void *client_main(void *arg) {
     memset(&j, 0, sizeof(j));
     j.fd = fd;
     j.req = req;
-    if (s->metrics_enabled) j.metrics_enqueued_ns = ds4_metrics_now_ns();
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
@@ -13174,6 +13138,7 @@ typedef struct {
     int tool_memory_max_ids;
     bool enable_cors;
     bool metrics_enabled;
+    int metrics_flush_tokens;
     int batched_sessions;
     int mixed_prefill_quantum;
 } server_config;
@@ -13314,6 +13279,7 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
+        .metrics_flush_tokens = 50,
         .mixed_prefill_quantum = 128,
     };
     c.kv_cache = kv_cache_default_options();
@@ -13383,6 +13349,9 @@ static server_config parse_options(int argc, char **argv) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--metrics")) {
             c.metrics_enabled = true;
+        } else if (!strcmp(arg, "--metrics-flush-tokens")) {
+            c.metrics_flush_tokens =
+                parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
@@ -13613,6 +13582,7 @@ int main(int argc, char **argv) {
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
     s.metrics_enabled = cfg.metrics_enabled;
+    s.metrics_flush_tokens = cfg.metrics_flush_tokens;
     ds4_metrics_init(s.batched_mode ? DS4_METRICS_MODE_RESIDENT_BATCHED :
                                       DS4_METRICS_MODE_SERIAL,
                      (uint64_t)slot_count);
@@ -14183,26 +14153,52 @@ static void test_prometheus_metrics_rendering(void) {
     char *default_argv[] = {"ds4-server"};
     server_config defaults = parse_options(1, default_argv);
     TEST_ASSERT(!defaults.metrics_enabled);
-    char *argv[] = {"ds4-server", "--metrics"};
-    server_config cfg = parse_options(2, argv);
+    TEST_ASSERT(defaults.metrics_flush_tokens == 50);
+    char *argv[] = {
+        "ds4-server", "--metrics", "--metrics-flush-tokens", "7"
+    };
+    server_config cfg = parse_options(4, argv);
     TEST_ASSERT(cfg.metrics_enabled);
+    TEST_ASSERT(cfg.metrics_flush_tokens == 7);
+
+    server sample_server = {.metrics_enabled = true, .metrics_flush_tokens = 50};
+    job sample_job = {0};
+    ds4_metrics_init(DS4_METRICS_MODE_SERIAL, 1);
+    for (int i = 0; i < 49; i++)
+        metrics_record_decode_token(&sample_server, &sample_job);
+    TEST_ASSERT(ds4_metric_read(DS4_M_DECODE_TOKENS) == 0);
+    metrics_record_decode_token(&sample_server, &sample_job);
+    TEST_ASSERT(ds4_metric_read(DS4_M_DECODE_TOKENS) == 50);
+    for (int i = 0; i < 3; i++)
+        metrics_record_decode_token(&sample_server, &sample_job);
+    metrics_flush_decode_tokens(&sample_job);
+    TEST_ASSERT(ds4_metric_read(DS4_M_DECODE_TOKENS) == 53);
 
     ds4_metrics_init(DS4_METRICS_MODE_RESIDENT_BATCHED, 4);
-    ds4_metrics_request_started();
-    ds4_metrics_prefill_cached_add(7);
-    uint64_t wait_started =
-        ds4_metrics_wait_begin(DS4_METRICS_PHASE_PREFILL);
-    ds4_metrics_wait_end(DS4_METRICS_PHASE_PREFILL, wait_started);
-    uint64_t compute_started =
-        ds4_metrics_compute_begin(DS4_METRICS_PHASE_PREFILL);
-    ds4_metrics_prefill_compute_end(compute_started, 11);
-    compute_started = ds4_metrics_compute_begin(DS4_METRICS_PHASE_DECODE);
-    ds4_metrics_decode_compute_end(compute_started, 3, 1);
-    ds4_metrics_decode_tokens_add(3);
-    ds4_metrics_observe_ttft(50000000ull);
-    ds4_metrics_observe_prefill_request(200000000ull);
-    ds4_metrics_observe_decode_request(2000000000ull);
-    ds4_metrics_request_finished(DS4_METRICS_OUTCOME_COMPLETED);
+    ds4_metric_add(DS4_M_REQUESTS_STARTED, 1);
+    ds4_metric_add(DS4_M_REQUESTS_INFLIGHT, 1);
+    ds4_metric_add(DS4_M_PREFILL_CACHED, 7);
+    uint64_t started = ds4_metrics_phase_begin(
+        DS4_M_WAITING_PREFILL, DS4_METRICS_PHASE_PREFILL);
+    ds4_metrics_phase_end(DS4_M_WAITING_PREFILL, DS4_M_WAIT_PREFILL,
+                          DS4_METRICS_PHASE_PREFILL, started);
+    started = ds4_metrics_phase_begin(
+        DS4_M_ACTIVE_PREFILL, DS4_METRICS_PHASE_PREFILL);
+    ds4_metrics_phase_end(DS4_M_ACTIVE_PREFILL, DS4_M_COMPUTE_PREFILL,
+                          DS4_METRICS_PHASE_PREFILL, started);
+    ds4_metric_add(DS4_M_PREFILL_COMPUTED, 11);
+    started = ds4_metrics_phase_begin(
+        DS4_M_ACTIVE_PREFILL, DS4_METRICS_PHASE_DECODE);
+    ds4_metrics_phase_end(DS4_M_ACTIVE_PREFILL, DS4_M_COMPUTE_PREFILL,
+                          DS4_METRICS_PHASE_DECODE, started);
+    ds4_metric_add(DS4_M_DECODE_STEPS, 1);
+    ds4_metric_add(DS4_M_DECODE_ROWS, 3);
+    ds4_metric_add(DS4_M_DECODE_TOKENS, 3);
+    ds4_metrics_histogram_observe(DS4_H_TTFT, 50000000ull);
+    ds4_metrics_histogram_observe(DS4_H_PREFILL, 200000000ull);
+    ds4_metrics_histogram_observe(DS4_H_DECODE, 2000000000ull);
+    ds4_metric_add(DS4_M_REQUEST_COMPLETED, 1);
+    ds4_metric_sub(DS4_M_REQUESTS_INFLIGHT);
 
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);

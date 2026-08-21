@@ -332,6 +332,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--metrics", "Expose bounded Prometheus serving metrics at GET /metrics.");
+    opt(fp, c, "--metrics-flush-tokens N", "Flush decode counters every N tokens. Default: 50.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128");

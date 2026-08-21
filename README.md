@@ -1099,6 +1099,12 @@ The metric schema is shared by serial and resident-batched serving and reserves
 the `continuous` serving-mode value for a rolling continuous engine without
 changing dashboards later.
 
+Decode token updates use the same 50-token cadence as DS4 main's generation
+progress log. `--metrics-flush-tokens N` changes that cadence. Tokens accumulate
+per request without atomics and flush in one relaxed update at the threshold and
+again on completion, failure, cancellation, or shutdown, so totals remain exact
+with bounded scrape staleness.
+
 The core counters separate actual prefill work from KV reuse and count decode
 rows independently from accelerator steps:
 
