@@ -1364,11 +1364,11 @@ The fixed header is little-endian:
 4   u8     routed expert quant bits, currently 2 or 4
 5   u8     save reason: 0 unknown, 1 cold, 2 continued, 3 evict, 4 shutdown
 6   u8     extension flags, bit 0 = tool-id map, bit 4 = hashed session id
-7   u8     reserved
+7   u8     model id (0 = Flash, 1 = Pro, 2 = GLM 5.2)
 8   u32    cached token count
 12  u32    hit count
 16  u32    context size the snapshot was written for
-20  u8     reserved
+20  u8     session payload ABI
 21  u8     optional retention class
 22  u8[2]  reserved
 24  u64    creation Unix time
