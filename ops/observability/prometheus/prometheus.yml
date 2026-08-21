@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 5s
+  evaluation_interval: 15s
+  external_labels:
+    fleet: ds4
+
+scrape_configs:
+  - job_name: ds4
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets: ["192.168.5.156:8000"]
+        labels:
+          instance: ds4-156
+          platform: cuda
+          architecture: aarch64
+      - targets: ["192.168.5.157:8000"]
+        labels:
+          instance: ds4-157
+          platform: rocm
+          architecture: x86_64
+      - targets: ["192.168.5.158:8000"]
+        labels:
+          instance: ds4-158
+          platform: cuda
+          architecture: aarch64
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
