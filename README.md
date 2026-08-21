@@ -1127,6 +1127,9 @@ rate(ds4_decode_batch_rows_total[5m])
   / rate(ds4_decode_steps_total[5m])
 ```
 
+A pinned Prometheus/Grafana Compose deployment, three-node scrape configuration,
+and provisioned DS4 dashboard are available in [`ops/observability`](ops/observability/README.md).
+
 ### Tool call handling and canonicalization
 
 DeepSeek V4 emits tool calls as [DSML text](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/encoding/README.md). Agent clients do not send that
