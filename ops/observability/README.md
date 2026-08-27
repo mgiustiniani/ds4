@@ -7,6 +7,10 @@ Docker Compose deployment for the three-node DS4 fleet. Prometheus scrapes
 - `ds4-157` — `192.168.5.157:8000` (ROCm/x86_64)
 - `ds4-158` — `192.168.5.158:8000` (CUDA/aarch64)
 
+It also scrapes the bounded Synapse Memory textfile surface through
+`192.168.5.163:9100`. The `synapse-memory` job uses fixed target labels only;
+its first-party series contain no PID, command, UID, path or cgroup labels.
+
 DS4 servers must be started with `--metrics`. The endpoint remains unavailable
 otherwise.
 

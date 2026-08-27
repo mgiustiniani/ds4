@@ -26,6 +26,18 @@ scrape_configs:
           platform: cuda
           architecture: aarch64
 
+  - job_name: synapse-memory
+    scrape_interval: 15s
+    scrape_timeout: 5s
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets: ["192.168.5.163:9100"]
+        labels:
+          instance: synapse-macbook9-1
+          platform: intel
+          architecture: x86_64
+
   - job_name: prometheus
     static_configs:
       - targets: ["localhost:9090"]
