@@ -16,6 +16,13 @@
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
+#define DS4_KVSTORE_EXT_SESSION_ID        (1u << 4)
+
+/* Optional server session provenance is stored immediately after the session
+ * payload and before protocol-specific trailers.  Persist only a SHA-1 hex
+ * digest of the untrusted HTTP identifier, never the identifier itself. */
+#define DS4_KVSTORE_SESSION_SHA_HEX_BYTES 40u
+#define DS4_KVSTORE_SESSION_ID_SECTION_BYTES 44u
 
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
@@ -26,6 +33,17 @@ typedef enum {
     DS4_KVSTORE_REASON_AGENT_SYSTEM  = 5,
     DS4_KVSTORE_REASON_AGENT_SESSION = 6,
 } ds4_kvstore_reason;
+
+/* Retention affects disk-cache admission and eviction only, never request
+ * scheduling. Legacy files sit between explicit background and foreground
+ * entries. Stable prefixes, such as agent/tool prompts before the task message,
+ * are the last class considered for eviction. */
+typedef enum {
+    DS4_KVSTORE_RETENTION_LEGACY        = 0,
+    DS4_KVSTORE_RETENTION_BACKGROUND    = 1,
+    DS4_KVSTORE_RETENTION_FOREGROUND    = 2,
+    DS4_KVSTORE_RETENTION_STABLE_PREFIX = 3,
+} ds4_kvstore_retention;
 
 typedef enum {
     DS4_KVSTORE_LOG_DEFAULT,
@@ -45,6 +63,7 @@ typedef struct {
      * older cache files where this reserved byte was always written as zero. */
     uint8_t model_id;
     uint8_t reason;
+    uint8_t retention;
     uint32_t tokens;
     uint32_t hits;
     uint32_t ctx_size;
@@ -54,6 +73,7 @@ typedef struct {
     uint64_t payload_bytes;
     uint64_t text_bytes;
     uint64_t file_size;
+    char session_sha[DS4_KVSTORE_SESSION_SHA_HEX_BYTES + 1u];
 } ds4_kvstore_entry;
 
 typedef struct {
@@ -62,6 +82,7 @@ typedef struct {
     int continued_interval_tokens;
     int boundary_trim_tokens;
     int boundary_align_tokens;
+    bool prioritize_retention;
 } ds4_kvstore_options;
 
 typedef struct {
@@ -85,7 +106,9 @@ typedef struct {
     uint8_t model_id;
     uint8_t quant_bits;
     uint32_t ctx_size;
+    uint8_t retention;
     bool reject_different_quant;
+    char session_sha[DS4_KVSTORE_SESSION_SHA_HEX_BYTES + 1u];
 } ds4_kvstore_eviction_context;
 
 typedef struct {
@@ -153,7 +176,7 @@ double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e,
                                         const ds4_tokens *live,
                                         uint64_t now,
                                         const ds4_kvstore_eviction_context *incoming);
-void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
+bool ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
@@ -165,6 +188,8 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         const ds4_tokens *tokens,
                                         int store_len,
                                         const char *reason,
+                                        uint8_t retention,
+                                        const char *session_sha,
                                         const char *cache_text_override,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
@@ -177,12 +202,16 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    const ds4_tokens *tokens,
                                    int store_len,
                                    const char *reason,
+                                   uint8_t retention,
+                                   const char *session_sha,
                                    const ds4_kvstore_trailer_hooks *hooks,
                                    char *err,
                                    size_t err_len);
 bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
                                        ds4_engine *engine,
                                        ds4_session *session,
+                                       uint8_t retention,
+                                       const char *session_sha,
                                        const ds4_kvstore_trailer_hooks *hooks,
                                        char *err,
                                        size_t err_len);
@@ -193,6 +222,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_tokens *effective_prompt,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,
+                              uint8_t retention,
                               bool responses_protocol);
 void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result);
 
@@ -202,11 +232,13 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
                                  ds4_kvstore_entry *out);
 void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                              uint8_t model_id, uint8_t quant_bits,
-                             uint8_t reason, uint8_t ext_flags,
+                             uint8_t reason, uint8_t retention,
+                             uint8_t ext_flags,
                              uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                              uint64_t created_at, uint64_t last_used,
                              uint64_t payload_bytes);
-bool ds4_kvstore_touch_file(const char *path, uint32_t hits);
+bool ds4_kvstore_touch_file(const char *path, uint32_t hits,
+                            uint8_t retention);
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]);
 void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]);
 char *ds4_kvstore_path_join(const char *dir, const char *name);
