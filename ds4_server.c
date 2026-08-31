@@ -434,6 +434,135 @@ static char *json_minify_raw_value(const char *json) {
     return buf_take(&b);
 }
 
+#define SERVER_IMAGE_MARKER_BYTES 64
+
+typedef struct {
+    char marker[SERVER_IMAGE_MARKER_BYTES];
+    uint8_t *encoded;
+    size_t encoded_len;
+} server_image_input;
+
+typedef struct {
+    server_image_input *v;
+    size_t len;
+    size_t cap;
+} server_image_inputs;
+
+static void server_image_inputs_free(server_image_inputs *images) {
+    if (!images) return;
+    for (size_t i = 0; i < images->len; i++) free(images->v[i].encoded);
+    free(images->v);
+    memset(images, 0, sizeof(*images));
+}
+
+static int base64_value(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return 26 + c - 'a';
+    if (c >= '0' && c <= '9') return 52 + c - '0';
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static bool server_decode_base64(const char *src, uint8_t **out, size_t *out_len) {
+    const size_t n = src ? strlen(src) : 0;
+    if (n == 0 || (n & 3u) != 0 || n > 64u * 1024u * 1024u)
+        return false;
+    size_t cap = (n / 4u) * 3u;
+    uint8_t *decoded = xmalloc(cap ? cap : 1);
+    size_t used = 0;
+    for (size_t i = 0; i < n; i += 4) {
+        int a = base64_value((unsigned char)src[i]);
+        int b = base64_value((unsigned char)src[i + 1]);
+        bool pad2 = src[i + 2] == '=';
+        bool pad3 = src[i + 3] == '=';
+        int c = pad2 ? 0 : base64_value((unsigned char)src[i + 2]);
+        int d = pad3 ? 0 : base64_value((unsigned char)src[i + 3]);
+        if (a < 0 || b < 0 || c < 0 || d < 0 ||
+            (pad2 && !pad3) || ((pad2 || pad3) && i + 4 != n)) {
+            free(decoded);
+            return false;
+        }
+        uint32_t bits = ((uint32_t)a << 18) | ((uint32_t)b << 12) |
+                        ((uint32_t)c << 6) | (uint32_t)d;
+        decoded[used++] = (uint8_t)(bits >> 16);
+        if (!pad2) decoded[used++] = (uint8_t)(bits >> 8);
+        if (!pad3) decoded[used++] = (uint8_t)bits;
+    }
+    *out = decoded;
+    *out_len = used;
+    return true;
+}
+
+static bool server_image_media_type(const char *media_type) {
+    return media_type &&
+           (!strcasecmp(media_type, "image/png") ||
+            !strcasecmp(media_type, "image/jpeg") ||
+            !strcasecmp(media_type, "image/jpg"));
+}
+
+static bool server_image_inputs_push_base64(server_image_inputs *images,
+                                            const char *media_type,
+                                            const char *base64,
+                                            char marker[SERVER_IMAGE_MARKER_BYTES]) {
+    if (!server_image_media_type(media_type)) return false;
+    server_image_input image = {0};
+    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len))
+        return false;
+    unsigned char nonce[12];
+    if (!random_bytes(nonce, sizeof(nonce))) {
+        uint64_t fallback = (uint64_t)time(NULL) ^
+                            ((uint64_t)getpid() << 32) ^
+                            (uint64_t)(uintptr_t)images;
+        memcpy(nonce, &fallback, sizeof(fallback));
+        memset(nonce + sizeof(fallback), 0, sizeof(nonce) - sizeof(fallback));
+    }
+    static const char hex[] = "0123456789abcdef";
+    size_t pos = (size_t)snprintf(image.marker, sizeof(image.marker),
+                                  "\036" "DS4_IMAGE_");
+    for (size_t i = 0; i < sizeof(nonce) && pos + 2 < sizeof(image.marker); i++) {
+        image.marker[pos++] = hex[nonce[i] >> 4];
+        image.marker[pos++] = hex[nonce[i] & 15];
+    }
+    image.marker[pos++] = '\x1f';
+    image.marker[pos] = '\0';
+    if (images->len == images->cap) {
+        size_t cap = images->cap ? images->cap * 2 : 2;
+        images->v = xrealloc(images->v, cap * sizeof(images->v[0]));
+        images->cap = cap;
+    }
+    images->v[images->len++] = image;
+    snprintf(marker, SERVER_IMAGE_MARKER_BYTES, "%s", image.marker);
+    return true;
+}
+
+static bool server_image_inputs_push_data_uri(
+        server_image_inputs *images, const char *uri,
+        char marker[SERVER_IMAGE_MARKER_BYTES]) {
+    static const char png[] = "data:image/png;base64,";
+    static const char jpeg[] = "data:image/jpeg;base64,";
+    static const char jpg[] = "data:image/jpg;base64,";
+    if (!uri) return false;
+    if (!strncmp(uri, png, sizeof(png) - 1))
+        return server_image_inputs_push_base64(
+            images, "image/png", uri + sizeof(png) - 1, marker);
+    if (!strncmp(uri, jpeg, sizeof(jpeg) - 1))
+        return server_image_inputs_push_base64(
+            images, "image/jpeg", uri + sizeof(jpeg) - 1, marker);
+    if (!strncmp(uri, jpg, sizeof(jpg) - 1))
+        return server_image_inputs_push_base64(
+            images, "image/jpg", uri + sizeof(jpg) - 1, marker);
+    return false;
+}
+
+static void append_owned_text(char **dst, const char *text) {
+    buf b = {0};
+    buf_puts(&b, *dst ? *dst : "");
+    buf_puts(&b, text ? text : "");
+    free(*dst);
+    *dst = buf_take(&b);
+}
+
 static bool json_content(const char **p, char **out) {
     json_ws(p);
     if (**p == '"') return json_string(p, out);
@@ -566,6 +695,8 @@ static void random_tool_id(char *dst, size_t dstlen, api_style api) {
 }
 
 typedef struct server server;
+static void server_inference_lock(server *s);
+static void server_inference_unlock(server *s);
 
 typedef struct {
     char *id;
@@ -608,6 +739,7 @@ typedef struct {
 typedef struct {
     char *role;
     char *content;
+    server_image_inputs images;
     char *reasoning;
     char *tool_call_id;
     char **tool_call_ids;
@@ -646,6 +778,8 @@ typedef struct {
     api_style api;
     server_model_syntax model_syntax;
     ds4_tokens prompt;
+    ds4_vision_span *images;
+    size_t image_count;
     char *model;
     bool model_from_request;
     stop_list stops;
@@ -666,6 +800,7 @@ typedef struct {
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
+    bool ignore_eos;
     int cache_read_tokens;
     int cache_write_tokens;
     uint8_t kv_retention;
@@ -741,6 +876,7 @@ static void chat_msg_add_tool_call_id(chat_msg *m, const char *id) {
 static void chat_msg_free(chat_msg *m) {
     free(m->role);
     free(m->content);
+    server_image_inputs_free(&m->images);
     free(m->reasoning);
     free(m->tool_call_id);
     for (int i = 0; i < m->tool_call_ids_len; i++) free(m->tool_call_ids[i]);
@@ -828,8 +964,24 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->think_mode = DS4_THINK_HIGH;
 }
 
+static bool parse_ignore_eos_value(const char **p, request *r) {
+    return p && r && json_bool(p, &r->ignore_eos);
+}
+
+static bool request_validate_ignore_eos(const request *r,
+                                        char *err, size_t errlen) {
+    if (!r || !r->ignore_eos) return true;
+    if (r->temperature_set && r->temperature == 0.0f) return true;
+    snprintf(err, errlen,
+             "ignore_eos requires an explicit temperature of 0");
+    return false;
+}
+
 static void request_free(request *r) {
     ds4_tokens_free(&r->prompt);
+    for (size_t i = 0; i < r->image_count; i++)
+        ds4_vision_embedding_free(&r->images[i].embedding);
+    free(r->images);
     free(r->model);
     for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
     free(r->stops.v);
@@ -1689,6 +1841,131 @@ bad:
     return false;
 }
 
+static bool parse_image_url_value(const char **p, char **url) {
+    json_ws(p);
+    if (**p == '"') return json_string(p, url);
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        bool ok = true;
+        if (!strcmp(key, "url")) {
+            char *next = NULL;
+            ok = json_string(p, &next);
+            if (ok) {
+                free(*url);
+                *url = next;
+            }
+        } else {
+            ok = json_skip_value(p);
+        }
+        free(key);
+        if (!ok) return false;
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return *url != NULL;
+}
+
+static bool parse_openai_content_object(const char **p, chat_msg *msg) {
+    if (**p != '{') return false;
+    (*p)++;
+    char *type = NULL;
+    char *text = NULL;
+    char *image_url = NULL;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) goto bad;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            goto bad;
+        }
+        (*p)++;
+        bool ok = true;
+        if (!strcmp(key, "type"))
+            ok = json_string_replace(p, &type);
+        else if (!strcmp(key, "text"))
+            ok = json_content_replace(p, &text);
+        else if (!strcmp(key, "image_url")) {
+            free(image_url);
+            image_url = NULL;
+            ok = parse_image_url_value(p, &image_url);
+        } else
+            ok = json_skip_value(p);
+        free(key);
+        if (!ok) goto bad;
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') goto bad;
+    (*p)++;
+
+    if (type && (!strcmp(type, "image_url") || !strcmp(type, "input_image"))) {
+        char marker[SERVER_IMAGE_MARKER_BYTES];
+        if (!server_image_inputs_push_data_uri(&msg->images, image_url, marker))
+            goto bad;
+        append_owned_text(&msg->content, marker);
+    } else if (text) {
+        append_owned_text(&msg->content, text);
+    }
+    free(type);
+    free(text);
+    free(image_url);
+    return true;
+bad:
+    free(type);
+    free(text);
+    free(image_url);
+    return false;
+}
+
+static bool parse_openai_content(const char **p, chat_msg *msg) {
+    json_ws(p);
+    if (**p == '"') {
+        char *text = NULL;
+        if (!json_string(p, &text)) return false;
+        append_owned_text(&msg->content, text);
+        free(text);
+        return true;
+    }
+    if (json_lit(p, "null")) return true;
+    if (**p != '[') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p == '"') {
+            char *text = NULL;
+            if (!json_string(p, &text)) return false;
+            append_owned_text(&msg->content, text);
+            free(text);
+        } else if (**p == '{') {
+            if (!parse_openai_content_object(p, msg)) return false;
+        } else if (!json_skip_value(p)) {
+            return false;
+        }
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') return false;
+    (*p)++;
+    return true;
+}
+
 static bool parse_messages(const char **p, chat_msgs *msgs) {
     json_ws(p);
     if (**p != '[') return false;
@@ -1715,7 +1992,10 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                     goto fail;
                 }
             } else if (!strcmp(key, "content")) {
-                if (!json_content_replace(p, &msg.content)) {
+                free(msg.content);
+                msg.content = NULL;
+                server_image_inputs_free(&msg.images);
+                if (!parse_openai_content(p, &msg)) {
                     free(key);
                     goto fail;
                 }
@@ -1751,6 +2031,7 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         (*p)++;
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
+        if (msg.images.len && strcmp(msg.role, "user")) goto fail;
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -1774,6 +2055,43 @@ static bool append_anthropic_block_content(buf *dst, const char *text) {
     return true;
 }
 
+static bool parse_anthropic_image_source(const char **p,
+                                         char **source_type,
+                                         char **media_type,
+                                         char **data) {
+    json_ws(p);
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        bool ok;
+        if (!strcmp(key, "type"))
+            ok = json_string_replace(p, source_type);
+        else if (!strcmp(key, "media_type"))
+            ok = json_string_replace(p, media_type);
+        else if (!strcmp(key, "data"))
+            ok = json_string_replace(p, data);
+        else
+            ok = json_skip_value(p);
+        free(key);
+        if (!ok) return false;
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
 /* Anthropic content is block-structured, while the engine consumes one compact
  * chat_msg per role.  Parsing collapses text/thinking into strings, converts
  * assistant tool_use blocks to tool_calls, and keeps tool_result blocks as
@@ -1789,6 +2107,9 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     char *name = NULL;
     char *input = NULL;
     char *tool_result = NULL;
+    char *source_type = NULL;
+    char *media_type = NULL;
+    char *image_data = NULL;
 
     json_ws(p);
     while (**p && **p != '}') {
@@ -1835,6 +2156,12 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "source")) {
+            if (!parse_anthropic_image_source(p, &source_type,
+                                               &media_type, &image_data)) {
+                free(key);
+                goto bad;
+            }
         } else if (!json_skip_value(p)) {
             free(key);
             goto bad;
@@ -1867,6 +2194,13 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
         buf_puts(&b, "</tool_result>");
         free(msg->content);
         msg->content = buf_take(&b);
+    } else if (type && !strcmp(type, "image")) {
+        char marker[SERVER_IMAGE_MARKER_BYTES];
+        if (!source_type || strcmp(source_type, "base64") ||
+            !server_image_inputs_push_base64(&msg->images, media_type,
+                                             image_data, marker))
+            goto bad;
+        append_owned_text(&msg->content, marker);
     } else {
         if (text) {
             buf b = {0};
@@ -1891,6 +2225,9 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     free(name);
     free(input);
     free(tool_result);
+    free(source_type);
+    free(media_type);
+    free(image_data);
     return true;
 bad:
     free(type);
@@ -1900,6 +2237,9 @@ bad:
     free(name);
     free(input);
     free(tool_result);
+    free(source_type);
+    free(media_type);
+    free(image_data);
     return false;
 }
 
@@ -1983,6 +2323,7 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
         (*p)++;
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
+        if (msg.images.len && strcmp(msg.role, "user")) goto fail;
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -2752,6 +3093,86 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
                                               tool_orders, think_mode);
 }
 
+static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
+                                               request *r,
+                                               const chat_msgs *msgs,
+                                               char *err, size_t errlen) {
+    size_t count = 0;
+    for (int i = 0; msgs && i < msgs->len; i++) count += msgs->v[i].images.len;
+    if (count == 0) {
+        ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+        return true;
+    }
+    if (count > 16) {
+        snprintf(err, errlen, "too many images; at most 16 are allowed");
+        return false;
+    }
+    if (!e || !s || !ds4_engine_has_vision(e)) {
+        snprintf(err, errlen, "image input requires starting ds4-server with --vision FILE");
+        return false;
+    }
+
+    server_image_input **inputs = xmalloc(count * sizeof(inputs[0]));
+    ds4_vision_embedding *embeddings = xmalloc(count * sizeof(embeddings[0]));
+    memset(embeddings, 0, count * sizeof(embeddings[0]));
+    size_t next = 0;
+    for (int i = 0; i < msgs->len; i++) {
+        for (size_t j = 0; j < msgs->v[i].images.len; j++)
+            inputs[next++] = &msgs->v[i].images.v[j];
+    }
+
+    bool ok = true;
+    server_inference_lock(s);
+    for (size_t i = 0; i < count; i++) {
+        if (!ds4_engine_vision_encode_memory(e, inputs[i]->encoded,
+                                             inputs[i]->encoded_len,
+                                             &embeddings[i], err, errlen)) {
+            ok = false;
+            break;
+        }
+    }
+    server_inference_unlock(s);
+    if (!ok) goto done;
+
+    r->images = xmalloc(count * sizeof(r->images[0]));
+    memset(r->images, 0, count * sizeof(r->images[0]));
+    const char *cursor = r->prompt_text;
+    for (size_t i = 0; i < count; i++) {
+        const char *marker = strstr(cursor, inputs[i]->marker);
+        if (!marker) {
+            snprintf(err, errlen, "image marker was lost while rendering the request");
+            ok = false;
+            break;
+        }
+        char *prefix = xstrndup(cursor, (size_t)(marker - cursor));
+        ds4_tokenize_rendered_chat(e, prefix, &r->prompt);
+        free(prefix);
+        if (!ds4_prompt_append_vision(e, &r->prompt, &r->images[i],
+                                      &embeddings[i], err, errlen)) {
+            ok = false;
+            break;
+        }
+        r->image_count++;
+        cursor = marker + strlen(inputs[i]->marker);
+    }
+    if (ok) ds4_tokenize_rendered_chat(e, cursor, &r->prompt);
+
+done:
+    for (size_t i = 0; i < count; i++)
+        ds4_vision_embedding_free(&embeddings[i]);
+    free(embeddings);
+    free(inputs);
+    if (!ok) {
+        ds4_tokens_free(&r->prompt);
+        for (size_t i = 0; i < r->image_count; i++)
+            ds4_vision_embedding_free(&r->images[i].embedding);
+        free(r->images);
+        r->images = NULL;
+        r->image_count = 0;
+    }
+    return ok;
+}
+
 /* Render only the semantic tail that must be appended to the live KV for a
  * tool-result continuation.
  *
@@ -3209,6 +3630,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "ignore_eos")) {
+            if (!parse_ignore_eos_value(&p, r)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "thinking")) {
             if (!parse_thinking_control_value(&p, &thinking_enabled)) {
                 free(key);
@@ -3248,6 +3674,12 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         request_free(r);
         return false;
     }
+    if (!request_validate_ignore_eos(r, err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
@@ -3261,7 +3693,12 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     chat_msgs_free(&msgs);
     free(tool_schemas);
     return true;
@@ -3477,7 +3914,13 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(system);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
@@ -3496,7 +3939,8 @@ bad:
  * recognized text blocks. Numbers / objects / arrays-of-primitives at the top
  * level all reject so the client sees a 400 instead of an answer built on
  * silently dropped context. */
-static bool parse_responses_content_array(const char **p, char **out) {
+static bool parse_responses_content_array(const char **p, char **out,
+                                          server_image_inputs *images) {
     json_ws(p);
     if (**p == '"') return json_string(p, out);
     if (json_lit(p, "null")) {
@@ -3519,12 +3963,14 @@ static bool parse_responses_content_array(const char **p, char **out) {
             (*p)++;
             char *type = NULL;
             char *text = NULL;
+            char *image_url = NULL;
             json_ws(p);
             while (**p && **p != '}') {
                 char *key = NULL;
                 if (!json_string(p, &key)) {
                     free(type);
                     free(text);
+                    free(image_url);
                     goto fail;
                 }
                 json_ws(p);
@@ -3532,6 +3978,7 @@ static bool parse_responses_content_array(const char **p, char **out) {
                     free(key);
                     free(type);
                     free(text);
+                    free(image_url);
                     goto fail;
                 }
                 (*p)++;
@@ -3540,6 +3987,7 @@ static bool parse_responses_content_array(const char **p, char **out) {
                         free(key);
                         free(type);
                         free(text);
+                        free(image_url);
                         goto fail;
                     }
                 } else if (!strcmp(key, "text")) {
@@ -3554,12 +4002,23 @@ static bool parse_responses_content_array(const char **p, char **out) {
                         free(key);
                         free(type);
                         free(text);
+                        free(image_url);
+                        goto fail;
+                    }
+                } else if (!strcmp(key, "image_url")) {
+                    free(image_url);
+                    image_url = NULL;
+                    if (!parse_image_url_value(p, &image_url)) {
+                        free(key);
+                        free(type);
+                        free(text);
                         goto fail;
                     }
                 } else if (!json_skip_value(p)) {
                     free(key);
                     free(type);
                     free(text);
+                    free(image_url);
                     goto fail;
                 }
                 free(key);
@@ -3570,6 +4029,7 @@ static bool parse_responses_content_array(const char **p, char **out) {
             if (**p != '}') {
                 free(type);
                 free(text);
+                free(image_url);
                 goto fail;
             }
             (*p)++;
@@ -3584,14 +4044,28 @@ static bool parse_responses_content_array(const char **p, char **out) {
                 !strcmp(type, "text") ||
                 !strcmp(type, "summary_text") ||
                 !strcmp(type, "reasoning_text"));
-            if (!is_text_block || !text) {
+            bool is_image_block = type && !strcmp(type, "input_image");
+            if (is_image_block) {
+                char marker[SERVER_IMAGE_MARKER_BYTES];
+                if (!images ||
+                    !server_image_inputs_push_data_uri(images, image_url, marker)) {
+                    free(type);
+                    free(text);
+                    free(image_url);
+                    goto fail;
+                }
+                buf_puts(&b, marker);
+            } else if (!is_text_block || !text) {
                 free(type);
                 free(text);
+                free(image_url);
                 goto fail;
+            } else {
+                buf_puts(&b, text);
             }
-            buf_puts(&b, text);
             free(type);
             free(text);
+            free(image_url);
         } else {
             /* Reject primitives, arrays-of-arrays, nulls: a content array
              * element must be either a string or a typed text object. */
@@ -3612,7 +4086,20 @@ fail:
 
 static bool parse_responses_content_array_replace(const char **p, char **dst) {
     char *tmp = NULL;
-    if (!parse_responses_content_array(p, &tmp)) return false;
+    if (!parse_responses_content_array(p, &tmp, NULL)) return false;
+    free(*dst);
+    *dst = tmp;
+    return true;
+}
+
+static bool parse_responses_content_array_multimodal(
+        const char **p, char **dst, server_image_inputs *images) {
+    char *tmp = NULL;
+    server_image_inputs_free(images);
+    if (!parse_responses_content_array(p, &tmp, images)) {
+        server_image_inputs_free(images);
+        return false;
+    }
     free(*dst);
     *dst = tmp;
     return true;
@@ -3663,6 +4150,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
         char *result = NULL;
         char *tools_json = NULL;
         char *status_str = NULL;
+        server_image_inputs content_images = {0};
         json_ws(p);
         while (**p && **p != '}') {
             char *key = NULL;
@@ -3684,7 +4172,8 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                     goto item_fail;
                 }
             } else if (!strcmp(key, "content")) {
-                if (!parse_responses_content_array_replace(p, &content)) {
+                if (!parse_responses_content_array_multimodal(
+                        p, &content, &content_images)) {
                     free(key);
                     goto item_fail;
                 }
@@ -3806,6 +4295,7 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            server_image_inputs_free(&content_images);
             buf_free(&pending_reasoning);
             return false;
         }
@@ -3825,6 +4315,7 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            server_image_inputs_free(&content_images);
             goto fail;
         }
         (*p)++;
@@ -3852,6 +4343,28 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            server_image_inputs_free(&content_images);
+            buf_free(&pending_reasoning);
+            return false;
+        }
+        if (content_images.len &&
+            (strcmp(t, "message") || (role && strcmp(role, "user")))) {
+            free(type);
+            free(role);
+            free(content);
+            free(name);
+            free(namespace);
+            free(call_id);
+            free(item_id);
+            free(arguments);
+            free(output);
+            free(input_str);
+            free(summary);
+            free(action);
+            free(result);
+            free(tools_json);
+            free(status_str);
+            server_image_inputs_free(&content_images);
             buf_free(&pending_reasoning);
             return false;
         }
@@ -3882,6 +4395,8 @@ item_fail:
             msg.role = xstrdup(role ? role : "user");
             msg.content = content ? content : xstrdup("");
             content = NULL;
+            msg.images = content_images;
+            memset(&content_images, 0, sizeof(content_images));
             if (!strcmp(msg.role, "assistant") && pending_reasoning.len) {
                 msg.reasoning = buf_take(&pending_reasoning);
             }
@@ -4009,6 +4524,7 @@ item_fail:
                     free(result);
                     free(tools_json);
                     free(status_str);
+                    server_image_inputs_free(&content_images);
                     buf_free(&pending_reasoning);
                     return false;
                 }
@@ -4049,6 +4565,7 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            server_image_inputs_free(&content_images);
             buf_free(&pending_reasoning);
             return false;
         }
@@ -4068,6 +4585,7 @@ item_fail:
         free(result);
         free(tools_json);
         free(status_str);
+        server_image_inputs_free(&content_images);
         json_ws(p);
         if (**p == ',') (*p)++;
         json_ws(p);
@@ -4414,7 +4932,15 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) {
+        chat_msgs_free(&msgs);
+        buf_free(&combined_tool_schemas);
+        buf_free(&loaded_tool_schemas);
+        free(instructions);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     chat_msgs_free(&msgs);
     buf_free(&combined_tool_schemas);
     buf_free(&loaded_tool_schemas);
@@ -8668,6 +9194,14 @@ struct server {
     uint64_t trace_seq;
 };
 
+static void server_inference_lock(server *s) {
+    pthread_mutex_lock(&s->inference_mu);
+}
+
+static void server_inference_unlock(server *s) {
+    pthread_mutex_unlock(&s->inference_mu);
+}
+
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
  * completion after it has written the response, so request data and the socket
  * remain valid without heap-allocating per-request job objects. */
@@ -10307,7 +10841,7 @@ static uint64_t trace_begin(
     fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
     trace_time(s->trace);
     fprintf(s->trace,
-            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nseed: %llu\n",
+            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nignore_eos: %d\nseed: %llu\n",
             j->req.kind == REQ_CHAT ? "chat" : "completion",
             j->req.model ? j->req.model : "",
             j->req.stream ? 1 : 0,
@@ -10321,6 +10855,7 @@ static uint64_t trace_begin(
             j->req.top_k,
             j->req.top_p,
             j->req.min_p,
+            j->req.ignore_eos ? 1 : 0,
             (unsigned long long)j->req.seed);
     fprintf(s->trace, "stream_include_usage: %d\n",
             j->req.stream_include_usage ? 1 : 0);
@@ -10766,6 +11301,66 @@ static int server_session_sync(server *s, server_slot *slot,
         uint64_t computed = rc == 0 && prefix.len > prefix_common ?
             (uint64_t)(prefix.len - prefix_common) : 0;
         METRICS_PREFILL_END(s, compute_started, computed);
+        if (rc == 0) done = ds4_session_pos(slot->session);
+        server_prefill_leave(s);
+        called = true;
+        if (rc != 0) return rc;
+        if (done >= prompt->len) return 0;
+        if (done < target) {
+            if (err && errlen) snprintf(err, errlen, "prefill made no progress");
+            return 1;
+        }
+    }
+    return (g_stop_requested || slot_job_cancelled(slot)) ?
+           DS4_SESSION_SYNC_INTERRUPTED : 0;
+}
+
+static int server_session_sync_multimodal(server *s, server_slot *slot,
+                                          const ds4_tokens *prompt,
+                                          const ds4_vision_span *images,
+                                          size_t image_count,
+                                          char *err, size_t errlen) {
+    if (!image_count)
+        return server_session_sync(s, slot, prompt, err, errlen);
+    if (!s || !slot || !prompt || !images) return 1;
+    if (!s->batched_mode) {
+        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        int rc = ds4_session_sync_multimodal(slot->session, prompt,
+                                             images, image_count,
+                                             err, errlen);
+        server_prefill_leave(s);
+        return rc;
+    }
+
+    int done = 0;
+    bool called = false;
+    while (!g_stop_requested && !slot_job_cancelled(slot) &&
+           (!called || done < prompt->len)) {
+        int quantum = server_prefill_quantum(s);
+        int target = done + quantum;
+        if (target > prompt->len || target < done) target = prompt->len;
+        if (target <= 0) target = prompt->len;
+        for (size_t i = 0; i < image_count; i++) {
+            uint64_t end = (uint64_t)images[i].token_start +
+                           images[i].embedding.token_count;
+            if ((uint64_t)target > images[i].token_start &&
+                (uint64_t)target < end) {
+                target = end > (uint64_t)prompt->len ? prompt->len : (int)end;
+            }
+        }
+        size_t prefix_images = 0;
+        while (prefix_images < image_count) {
+            uint64_t end = (uint64_t)images[prefix_images].token_start +
+                           images[prefix_images].embedding.token_count;
+            if (end > (uint64_t)target) break;
+            prefix_images++;
+        }
+        ds4_tokens prefix = *prompt;
+        prefix.len = target;
+        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        int rc = ds4_session_sync_multimodal(slot->session, &prefix,
+                                             images, prefix_images,
+                                             err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
         server_prefill_leave(s);
         called = true;
@@ -11482,6 +12077,13 @@ static uint64_t server_next_sequence(server *s) {
 static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
+    const bool multimodal = j->req.image_count != 0;
+    if (multimodal) {
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_session_invalidate(slot->session);
+        pthread_mutex_unlock(&s->inference_mu);
+        request_live_state_clear(s, slot);
+    }
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
@@ -11602,13 +12204,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    trace_cache_miss_reason(&cache_diag));
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
-    if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
+    if (!multimodal && s->kv.enabled && cached == 0 &&
+        old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
         kv_cache_store_current(s, slot, "evict");
     }
-    if (cached == 0) {
+    if (!multimodal && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
                                         &disk_cache_path,
                                         &disk_cache_ext_flags);
@@ -11714,7 +12317,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
 
     int cold_store_len = 0;
     uint8_t cold_retention = slot->kv_retention;
-    if (cached == 0 &&
+    if (!multimodal && cached == 0 &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
         s->kv.opt.cold_max_tokens > 0 &&
@@ -11783,8 +12386,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    if (server_session_sync(s, slot, prompt_for_sync,
-                            err, sizeof(err)) != 0) {
+    int prompt_sync_rc = multimodal ?
+        server_session_sync_multimodal(s, slot, prompt_for_sync,
+                                       j->req.images, j->req.image_count,
+                                       err, sizeof(err)) :
+        server_session_sync(s, slot, prompt_for_sync, err, sizeof(err));
+    if (prompt_sync_rc != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(slot->session, NULL, NULL);
         ds4_session_set_display_progress(slot->session, NULL, NULL);
@@ -11818,7 +12425,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
-    kv_cache_maybe_store_continued(s, slot);
+    if (!multimodal) kv_cache_maybe_store_continued(s, slot);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -11832,7 +12439,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         j->metrics_prefill_started_ns = 0;
     }
     if (cold_store_len == prompt_for_sync->len) {
-        if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
+        if (!multimodal &&
+            kv_cache_store_live_prefix(s, slot, prompt_for_sync,
                                        cold_store_len, "cold",
                                        cold_retention)) {
             kv_cache_slot_note_store(slot, cold_store_len);
@@ -11962,7 +12570,7 @@ decode_again:
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            kv_cache_maybe_store_continued(s, slot);
+            if (!multimodal) kv_cache_maybe_store_continued(s, slot);
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -11981,8 +12589,17 @@ decode_again:
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
-        int token = ds4_session_sample(slot->session, temperature, top_k,
-                                       top_p, min_p, &rng);
+        const int eos_token = ds4_token_eos(s->engine);
+        int token = j->req.ignore_eos ?
+            ds4_session_argmax_ignoring_eos(slot->session,
+                                            j->req.think_mode) :
+            ds4_session_sample(slot->session, temperature, top_k,
+                               top_p, min_p, &rng);
+        if (token < 0) {
+            finish = "error";
+            snprintf(err, sizeof(err), "failed to select a non-EOS token");
+            break;
+        }
         if (ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
                                              j->req.think_mode)) {
@@ -11998,12 +12615,19 @@ decode_again:
         {
             uint64_t compute_started = METRICS_BEGIN(
                 s, DS4_M_ACTIVE_PREFILL, DS4_METRICS_PHASE_DECODE);
-            ntok = ds4_session_eval_speculative(
-                slot->session, token, max_tokens - completion,
-                ds4_token_eos(s->engine), temperature, top_k,
-                top_p, min_p, &rng,
-                toks, (int)(sizeof(toks) / sizeof(toks[0])),
-                err, sizeof(err));
+            if (j->req.ignore_eos) {
+                ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
+                    slot->session, token, max_tokens - completion,
+                    eos_token, j->req.think_mode,
+                    toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                    err, sizeof(err));
+            } else {
+                ntok = ds4_session_eval_speculative(
+                    slot->session, token, max_tokens - completion,
+                    eos_token, temperature, top_k, top_p, min_p, &rng,
+                    toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                    err, sizeof(err));
+            }
             METRICS_DECODE_END(s, compute_started, 1, ntok >= 0);
             if (ntok < 0) {
                 finish = "error";
@@ -13083,6 +13707,7 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"top_p\","
             "\"top_k\","
             "\"min_p\","
+            "\"ignore_eos\","
             "\"stop\","
             "\"seed\","
             "\"stream\","
@@ -13589,6 +14214,8 @@ static server_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--vision")) {
+            c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.glm_mtp = true;
         } else if (!strcmp(arg, "--mtp-model")) {
@@ -15530,7 +16157,50 @@ static void test_request_defaults_use_min_p_filtering(void) {
     TEST_ASSERT(r.top_p == DS4_DEFAULT_TOP_P);
     TEST_ASSERT(r.top_k == 0);
     TEST_ASSERT(r.min_p == DS4_DEFAULT_MIN_P);
+    TEST_ASSERT(!r.ignore_eos);
     request_free(&r);
+}
+
+static void test_chat_ignore_eos_contract(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    char err[128] = {0};
+
+    const char *p = "true";
+    TEST_ASSERT(parse_ignore_eos_value(&p, &r));
+    TEST_ASSERT(r.ignore_eos);
+    TEST_ASSERT(*p == '\0');
+    TEST_ASSERT(!request_validate_ignore_eos(&r, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "temperature") != NULL);
+
+    r.temperature_set = true;
+    r.temperature = 0.0f;
+    TEST_ASSERT(request_validate_ignore_eos(&r, err, sizeof(err)));
+
+    p = "false";
+    TEST_ASSERT(parse_ignore_eos_value(&p, &r));
+    TEST_ASSERT(!r.ignore_eos);
+    TEST_ASSERT(*p == '\0');
+
+    p = "1";
+    TEST_ASSERT(!parse_ignore_eos_value(&p, &r));
+    request_free(&r);
+
+    bool ok = parse_chat_request(
+        NULL, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"ignore_eos\":true}",
+        128, 32768, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(strstr(err, "temperature") != NULL);
+
+    ok = parse_chat_request(
+        NULL, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"temperature\":0,\"ignore_eos\":\"yes\"}",
+        128, 32768, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(!strcmp(err, "invalid JSON request"));
 }
 
 static void test_reasoning_effort_mapping(void) {
@@ -17580,6 +18250,7 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":32768") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"ignore_eos\"") != NULL);
     buf_free(&b);
 
     append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
@@ -19400,12 +20071,88 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+static const char test_inline_png_base64[] =
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFUlEQVR4nGP8z8DQwMDAwMAEIkAYABglAYOd/VRoAAAAAElFTkSuQmCC";
+
+static void test_openai_inline_image_content(void) {
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\","
+        "\"text\":\"describe \"},{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"data:image/png;base64,");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}},{\"type\":\"text\",\"text\":\" please\"}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].images.len == 1);
+    TEST_ASSERT(strstr(msgs.v[0].content, "describe ") == msgs.v[0].content);
+    TEST_ASSERT(strstr(msgs.v[0].content, " please") != NULL);
+    TEST_ASSERT(msgs.v[0].images.v[0].encoded_len >= 8);
+    TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded, "\x89PNG\r\n\x1a\n", 8));
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+}
+
+static void test_http_image_paths_and_urls_are_rejected(void) {
+    const char *cases[] = {
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"https://example.com/a.png\"}}]}]",
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"/tmp/a.png\"}}]}]",
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *p = cases[i];
+        chat_msgs msgs = {0};
+        TEST_ASSERT(!parse_messages(&p, &msgs));
+        chat_msgs_free(&msgs);
+    }
+}
+
+static void test_anthropic_inline_image_content(void) {
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image\","
+        "\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\","
+        "\"data\":\"");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}},{\"type\":\"text\",\"text\":\"describe\"}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].images.len == 1);
+    TEST_ASSERT(strstr(msgs.v[0].content, "describe") != NULL);
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+}
+
+static void test_responses_inline_image_content(void) {
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"type\":\"input_text\",\"text\":\"describe \"},"
+        "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}]");
+    const char *p = json.ptr;
+    char *content = NULL;
+    server_image_inputs images = {0};
+    TEST_ASSERT(parse_responses_content_array_multimodal(&p, &content, &images));
+    TEST_ASSERT(images.len == 1);
+    TEST_ASSERT(strstr(content, "describe ") == content);
+    free(content);
+    server_image_inputs_free(&images);
+    buf_free(&json);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
     test_kv_cache_priority_option();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
+    test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();
     test_api_thinking_controls_parse();
@@ -19485,6 +20232,10 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
+    test_openai_inline_image_content();
+    test_http_image_paths_and_urls_are_rejected();
+    test_anthropic_inline_image_content();
+    test_responses_inline_image_content();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();
     test_stop_list_parses_all_sequences();
